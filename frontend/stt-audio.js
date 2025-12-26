@@ -14,6 +14,21 @@ let sourceNode = null;
 // Callbacks
 let onAudioData = null;  // Called with PCM16 data for STT
 let onError = null;      // Called with error messages
+let stateChangeCallback = null;  // Called when recording state changes
+
+// Current state for state change notifications
+let currentState = 'idle';  // 'idle' | 'listening' | 'recording'
+
+// ========== State Change Helper ==========
+function setState(newState) {
+  if (newState !== currentState) {
+    const oldState = currentState;
+    currentState = newState;
+    if (stateChangeCallback) {
+      stateChangeCallback(newState, oldState);
+    }
+  }
+}
 
 // ========== Audio Context Management ==========
 function initializeAudioContext() {
@@ -25,12 +40,39 @@ function initializeAudioContext() {
   return sttAudioContext;
 }
 
+/**
+ * Initialize audio capture system
+ * Must be called from a user gesture (click/tap)
+ * @returns {Promise<boolean>} Success status
+ */
+export async function initAudioCapture() {
+  try {
+    const ctx = initializeAudioContext();
+    await ctx.resume();
+    console.log('STT Audio: Audio capture initialized');
+    return true;
+  } catch (error) {
+    console.error('STT Audio: Failed to initialize audio capture:', error);
+    return false;
+  }
+}
+
+/**
+ * Register callback for state changes
+ * @param {Function} callback - Called with (newState, oldState)
+ */
+export function onStateChange(callback) {
+  if (typeof callback === 'function') {
+    stateChangeCallback = callback;
+  }
+}
+
 // ========== Microphone Capture ==========
 /**
  * Start microphone capture for STT
  * Outputs PCM16 @ 16kHz via callback
  */
-async function startMicrophone(callback) {
+export async function startMicrophone(callback) {
   if (isRecording) {
     console.log('STT Audio: Already recording');
     return;
@@ -78,6 +120,7 @@ async function startMicrophone(callback) {
     sourceNode.connect(sttProcessor);
 
     isRecording = true;
+    setState('listening');
     console.log('STT Audio: Recording started');
 
   } catch (error) {
@@ -97,7 +140,7 @@ async function startMicrophone(callback) {
 /**
  * Stop microphone capture
  */
-function stopMicrophone() {
+export function stopMicrophone() {
   if (!isRecording) {
     console.log('STT Audio: Not recording');
     return;
@@ -121,15 +164,16 @@ function stopMicrophone() {
   }
 
   isRecording = false;
+  setState('idle');
   console.log('STT Audio: Recording stopped');
 }
 
 // ========== State Getters ==========
-function getMicrophoneState() {
+export function getMicrophoneState() {
   return isRecording;
 }
 
-function getStatus() {
+export function getStatus() {
   return {
     isRecording,
     hasAudioContext: !!sttAudioContext,
@@ -139,20 +183,20 @@ function getStatus() {
 }
 
 // ========== Callback Management ==========
-function setAudioDataCallback(callback) {
+export function setAudioDataCallback(callback) {
   if (typeof callback === 'function') {
     onAudioData = callback;
   }
 }
 
-function setErrorCallback(callback) {
+export function setErrorCallback(callback) {
   if (typeof callback === 'function') {
     onError = callback;
   }
 }
 
 // ========== Cleanup ==========
-function cleanup() {
+export function cleanup() {
   stopMicrophone();
 
   if (sttAudioContext && sttAudioContext.state !== 'closed') {
@@ -162,24 +206,12 @@ function cleanup() {
   sttAudioContext = null;
   onAudioData = null;
   onError = null;
+  stateChangeCallback = null;
+  setState('idle');
 
   console.log('STT Audio: Cleanup complete');
 }
 
-// ========== Public API Export ==========
-window.STTAudio = {
-  // Microphone control
-  startMicrophone,
-  stopMicrophone,
-
-  // State
-  getMicrophoneState,
-  getStatus,
-
-  // Callbacks
-  setAudioDataCallback,
-  setErrorCallback,
-
-  // Cleanup
-  cleanup
-};
+// ========== Aliases for editor.js compatibility ==========
+export const startRecording = startMicrophone;
+export const stopRecording = stopMicrophone;

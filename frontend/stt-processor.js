@@ -1,29 +1,35 @@
 /**
- * stt-processor.js - AudioWorkletProcessor for STT
- * Runs in a separate audio thread for low-latency processing
+ * stt-processor.js - AudioWorklet Processor for STT
+ * Captures microphone input, downsamples to 16kHz, outputs PCM16
  *
- * Note: This file runs in an AudioWorklet context and cannot import other modules
+ * Note: VAD is handled by backend RealtimeSTT (Silero/WebRTC)
+ * This processor only handles audio capture and format conversion
  */
 
 class STTProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super()
 
-    // Buffer configuration
-    this.bufferSize = options.processorOptions?.bufferSize || 4096
-    this.buffer = new Float32Array(this.bufferSize)
-    this.bufferIndex = 0
+    // Target sample rate for STT (RealtimeSTT expects 16kHz)
+    this.targetSampleRate = 16000
 
-    // State
+    // Source sample rate from AudioContext (typically 48kHz)
+    this.sourceSampleRate = sampleRate
+
+    // Calculate decimation ratio for downsampling
+    this.decimationRatio = this.sourceSampleRate / this.targetSampleRate
+
+    // Buffer for accumulating downsampled samples
+    this.buffer = []
+
+    // Phase accumulator for decimation
+    this.phase = 0
+
+    // Chunk size: 320 samples = 20ms @ 16kHz (optimal for real-time STT)
+    this.chunkSize = 320
+
+    // Active state - controlled by main thread
     this.isActive = false
-    this.isPaused = false
-
-    // VAD (Voice Activity Detection) configuration
-    this.vadThreshold = 0.015          // RMS threshold for voice detection
-    this.silenceFrameThreshold = 50    // Frames of silence before vad_stop (~700ms at 128 samples/frame)
-    this.silenceFrameCount = 0
-    this.isSpeaking = false
-    this.hasSpoken = false             // Track if user has spoken during this session
 
     // Handle commands from main thread
     this.port.onmessage = this.handleCommand.bind(this)
@@ -39,143 +45,97 @@ class STTProcessor extends AudioWorkletProcessor {
     switch (command) {
       case 'start':
         this.isActive = true
-        this.isPaused = false
-        this.hasSpoken = false
-        this.silenceFrameCount = 0
+        this.buffer = []
+        this.phase = 0
         break
 
       case 'stop':
         this.isActive = false
-        this.isPaused = false
-        this.isSpeaking = false
-        this.hasSpoken = false
+        this.buffer = []
+        this.phase = 0
         break
 
       case 'pause':
-        this.isPaused = true
+        this.isActive = false
         break
 
       case 'resume':
-        this.isPaused = false
+        this.isActive = true
         break
     }
   }
 
   /**
    * Process audio samples
-   * Called by the audio rendering thread for each quantum of audio
+   * Called by audio rendering thread for each quantum (~128 samples)
    * @param {Array<Float32Array[]>} inputs - Input audio buffers
-   * @param {Array<Float32Array[]>} outputs - Output audio buffers (not used)
+   * @param {Array<Float32Array[]>} outputs - Output audio buffers (unused)
    * @param {Record<string, Float32Array>} parameters - Parameter values
    * @returns {boolean} - Return true to keep processor alive
    */
   process(inputs, outputs, parameters) {
     const input = inputs[0]
 
-    // No input or not active
-    if (!input || !input[0] || !this.isActive || this.isPaused) {
+    // No input or not active - keep processor alive but don't process
+    if (!input || !input[0] || !this.isActive) {
       return true
     }
 
-    const samples = input[0]
+    const inputData = input[0]
 
-    // Calculate RMS (Root Mean Square) for VAD
-    const rms = this.calculateRMS(samples)
+    // Downsample from source rate to 16kHz using linear interpolation
+    this.downsampleAndBuffer(inputData)
 
-    // Voice Activity Detection
-    this.processVAD(rms)
+    // Send chunks when we have enough samples
+    this.flushChunks()
 
-    // Buffer samples for transmission
-    this.bufferSamples(samples)
-
-    return true // Keep processor alive
+    return true
   }
 
   /**
-   * Calculate RMS of samples
-   * @param {Float32Array} samples
-   * @returns {number}
+   * Downsample audio and add to buffer
+   * Uses simple decimation with linear interpolation for better quality
+   * @param {Float32Array} inputData - Raw audio samples at source rate
    */
-  calculateRMS(samples) {
-    let sumSquares = 0
-    for (let i = 0; i < samples.length; i++) {
-      sumSquares += samples[i] * samples[i]
-    }
-    return Math.sqrt(sumSquares / samples.length)
-  }
+  downsampleAndBuffer(inputData) {
+    for (let i = 0; i < inputData.length; i++) {
+      // Check if we should take this sample based on decimation ratio
+      const targetIndex = Math.floor(this.phase)
 
-  /**
-   * Process Voice Activity Detection
-   * @param {number} rms - Current RMS level
-   */
-  processVAD(rms) {
-    const wasSpeaking = this.isSpeaking
+      if (targetIndex <= i) {
+        // Clamp sample to [-1, 1] range
+        const sample = Math.max(-1, Math.min(1, inputData[i]))
 
-    if (rms > this.vadThreshold) {
-      // Voice detected
-      this.isSpeaking = true
-      this.silenceFrameCount = 0
+        // Convert to 16-bit PCM range and store
+        this.buffer.push(Math.round(sample * 32767))
 
-      if (!wasSpeaking) {
-        this.hasSpoken = true
-        this.port.postMessage({ type: 'vad_start' })
-      }
-    } else if (this.isSpeaking) {
-      // Silence during speech
-      this.silenceFrameCount++
-
-      if (this.silenceFrameCount > this.silenceFrameThreshold) {
-        // Enough silence to consider speech ended
-        this.isSpeaking = false
-        this.port.postMessage({ type: 'vad_stop' })
+        // Advance phase by decimation ratio
+        this.phase += this.decimationRatio
       }
     }
+
+    // Reset phase relative to processed samples
+    this.phase -= inputData.length
+    if (this.phase < 0) this.phase = 0
   }
 
   /**
-   * Buffer samples and send when full
-   * @param {Float32Array} samples
+   * Send complete chunks to main thread
    */
-  bufferSamples(samples) {
-    for (let i = 0; i < samples.length; i++) {
-      this.buffer[this.bufferIndex++] = samples[i]
+  flushChunks() {
+    while (this.buffer.length >= this.chunkSize) {
+      // Extract chunk from buffer
+      const chunk = this.buffer.splice(0, this.chunkSize)
 
-      if (this.bufferIndex >= this.bufferSize) {
-        // Buffer full - convert and send
-        const int16Buffer = this.float32ToInt16(this.buffer)
+      // Convert to Int16Array
+      const int16Chunk = new Int16Array(chunk)
 
-        // Transfer ownership for zero-copy
-        this.port.postMessage(
-          { type: 'audio', data: int16Buffer },
-          [int16Buffer.buffer]
-        )
-
-        // Reset buffer
-        this.buffer = new Float32Array(this.bufferSize)
-        this.bufferIndex = 0
-      }
+      // Send to main thread with transferable buffer
+      this.port.postMessage(
+        { type: 'audio', data: int16Chunk },
+        [int16Chunk.buffer]
+      )
     }
-  }
-
-  /**
-   * Convert Float32Array to Int16Array (PCM16)
-   * @param {Float32Array} float32Array
-   * @returns {Int16Array}
-   */
-  float32ToInt16(float32Array) {
-    const int16Array = new Int16Array(float32Array.length)
-
-    for (let i = 0; i < float32Array.length; i++) {
-      // Clamp to [-1, 1] range
-      const sample = Math.max(-1, Math.min(1, float32Array[i]))
-
-      // Convert to Int16 range [-32768, 32767]
-      int16Array[i] = sample < 0
-        ? sample * 0x8000
-        : sample * 0x7FFF
-    }
-
-    return int16Array
   }
 }
 

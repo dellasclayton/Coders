@@ -1,6 +1,9 @@
 /**
  * stt-audio.js - Audio Input Capture for STT
- * Handles microphone capture, VAD, and audio streaming to server
+ * Handles microphone capture and audio streaming to server
+ *
+ * Note: VAD is handled by backend RealtimeSTT (Silero/WebRTC)
+ * This module continuously streams audio when active
  */
 
 import * as websocket from './websocket.js'
@@ -13,7 +16,7 @@ const state = {
   mediaStream: null,
   workletNode: null,
   sourceNode: null,
-  status: 'idle', // 'idle' | 'listening' | 'recording' | 'paused'
+  status: 'idle', // 'idle' | 'recording' | 'paused'
   isTTSPlaying: false,
   stateListeners: new Set(),
 }
@@ -22,9 +25,10 @@ const state = {
 // CONFIGURATION
 // ============================================
 const config = {
-  sampleRate: 16000,
+  // Use browser's native sample rate (typically 48kHz)
+  // Processor handles downsampling to 16kHz for STT
+  sampleRate: 48000,
   channelCount: 1,
-  bufferSize: 4096,
 }
 
 // ============================================
@@ -40,7 +44,6 @@ export async function initAudioCapture() {
     // Request microphone access
     state.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        sampleRate: config.sampleRate,
         channelCount: config.channelCount,
         echoCancellation: true,
         noiseSuppression: true,
@@ -48,7 +51,7 @@ export async function initAudioCapture() {
       }
     })
 
-    // Create audio context
+    // Create audio context at native sample rate
     state.audioContext = new AudioContext({
       sampleRate: config.sampleRate,
     })
@@ -60,19 +63,14 @@ export async function initAudioCapture() {
     // Create worklet node
     state.workletNode = new AudioWorkletNode(
       state.audioContext,
-      'stt-processor',
-      {
-        processorOptions: {
-          bufferSize: config.bufferSize,
-        }
-      }
+      'stt-processor'
     )
 
     // Connect audio pipeline
     state.sourceNode = state.audioContext.createMediaStreamSource(state.mediaStream)
     state.sourceNode.connect(state.workletNode)
 
-    // Handle messages from worklet
+    // Handle audio data from worklet
     state.workletNode.port.onmessage = handleWorkletMessage
 
     console.log('[STT] Audio capture initialized')
@@ -97,7 +95,7 @@ export function isInitialized() {
 // ============================================
 
 /**
- * Start recording/listening
+ * Start recording - begins streaming audio to server
  */
 export function startRecording() {
   if (!isInitialized()) {
@@ -105,7 +103,7 @@ export function startRecording() {
     return
   }
 
-  if (state.status === 'recording' || state.status === 'listening') {
+  if (state.status === 'recording') {
     return
   }
 
@@ -114,30 +112,40 @@ export function startRecording() {
     state.audioContext.resume()
   }
 
-  // If TTS is playing, go to paused state instead
+  // If TTS is playing, go to paused state and wait
   if (state.isTTSPlaying) {
     setStatus('paused')
+    console.log('[STT] TTS playing - will start when finished')
     return
   }
 
-  setStatus('listening')
+  // Enable mic track (in case it was muted)
+  setMicEnabled(true)
+
+  // Start the processor
   state.workletNode.port.postMessage({ command: 'start' })
+
+  // Tell server we're starting
   websocket.startListening()
 
-  console.log('[STT] Started listening')
+  setStatus('recording')
+  console.log('[STT] Recording started')
 }
 
 /**
- * Stop recording/listening
+ * Stop recording completely
  */
 export function stopRecording() {
   if (!isInitialized()) return
 
-  setStatus('idle')
+  // Stop the processor
   state.workletNode.port.postMessage({ command: 'stop' })
+
+  // Tell server we're stopping
   websocket.stopListening()
 
-  console.log('[STT] Stopped')
+  setStatus('idle')
+  console.log('[STT] Recording stopped')
 }
 
 /**
@@ -149,19 +157,11 @@ export function isRecording() {
 }
 
 /**
- * Check if currently listening (waiting for voice)
- * @returns {boolean}
- */
-export function isListening() {
-  return state.status === 'listening'
-}
-
-/**
- * Check if active (listening or recording)
+ * Check if active (recording or paused waiting for TTS)
  * @returns {boolean}
  */
 export function isActive() {
-  return state.status === 'listening' || state.status === 'recording'
+  return state.status === 'recording' || state.status === 'paused'
 }
 
 /**
@@ -173,30 +173,53 @@ export function getStatus() {
 }
 
 // ============================================
-// TTS COORDINATION
+// TTS COORDINATION (Echo Prevention)
 // ============================================
 
 /**
- * Set TTS playing state (called by tts-audio.js)
+ * Set TTS playing state - handles pause/resume and echo prevention
+ * Called by tts-audio.js when playback starts/stops
  * @param {boolean} isPlaying
  */
 export function setTTSPlaying(isPlaying) {
   state.isTTSPlaying = isPlaying
 
   if (isPlaying) {
-    // Pause recording during TTS
-    if (state.status === 'recording' || state.status === 'listening') {
+    // TTS starting - pause recording and mute mic to prevent echo
+    if (state.status === 'recording') {
+      // Pause the processor
       state.workletNode?.port.postMessage({ command: 'pause' })
+
+      // Mute mic track to prevent TTS audio feedback
+      setMicEnabled(false)
+
       setStatus('paused')
-      console.log('[STT] Paused for TTS playback')
+      console.log('[STT] Paused for TTS (mic muted)')
     }
   } else {
-    // Resume listening after TTS ends
+    // TTS finished - resume recording if we were paused
     if (state.status === 'paused') {
+      // Re-enable mic track
+      setMicEnabled(true)
+
+      // Resume the processor
       state.workletNode?.port.postMessage({ command: 'resume' })
-      setStatus('listening')
-      console.log('[STT] Resumed after TTS playback')
+
+      setStatus('recording')
+      console.log('[STT] Resumed after TTS (mic enabled)')
     }
+  }
+}
+
+/**
+ * Enable/disable microphone track (for echo prevention)
+ * @param {boolean} enabled
+ */
+function setMicEnabled(enabled) {
+  if (state.mediaStream) {
+    state.mediaStream.getAudioTracks().forEach(track => {
+      track.enabled = enabled
+    })
   }
 }
 
@@ -211,29 +234,9 @@ export function setTTSPlaying(isPlaying) {
 function handleWorkletMessage(event) {
   const { type, data } = event.data
 
-  switch (type) {
-    case 'audio':
-      // data is Int16Array - send to server
-      if (state.status === 'recording') {
-        websocket.sendAudio(data.buffer)
-      }
-      break
-
-    case 'vad_start':
-      // Voice activity detected
-      if (state.status === 'listening') {
-        setStatus('recording')
-        console.log('[STT] Voice detected - recording')
-      }
-      break
-
-    case 'vad_stop':
-      // Silence detected after speech
-      if (state.status === 'recording') {
-        setStatus('listening')
-        console.log('[STT] Silence detected - listening')
-      }
-      break
+  if (type === 'audio') {
+    // data is Int16Array - send to server as binary
+    websocket.sendAudio(data.buffer)
   }
 }
 

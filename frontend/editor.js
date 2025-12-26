@@ -417,13 +417,13 @@ export async function handleMic() {
 /**
  * Update mic button visual state
  * @param {HTMLElement} button
- * @param {string} status - 'idle' | 'listening' | 'recording' | 'paused'
+ * @param {string} status - 'idle' | 'recording' | 'paused'
  */
 function updateMicButtonState(button, status) {
   if (!button) return;
 
   // Remove all state classes
-  button.classList.remove('listening', 'recording', 'paused');
+  button.classList.remove('recording', 'paused');
 
   // Add appropriate class
   if (status !== 'idle') {

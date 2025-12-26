@@ -408,7 +408,7 @@ export async function handleMic() {
     console.log('[Editor] Mic deactivated');
   } else {
     // Start listening
-    sttAudio.startRecording();
+    await sttAudio.startRecording();
     isMicActive = true;
     console.log('[Editor] Mic activated');
   }

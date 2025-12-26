@@ -1,25 +1,32 @@
-// ============================================
-// STT AUDIO - Microphone Capture Module
-// ============================================
+/**
+ * stt-audio.js - Speech-to-Text Audio Capture Module
+ * Captures microphone audio and streams it to the server via WebSocket
+ */
 
-// ========== State Variables ==========
-let sttAudioContext = null;
-let stream = null;
-let isRecording = false;
+import * as websocket from './websocket.js';
 
-// STT (microphone capture)
-let sttProcessor = null;
+// ============================================
+// STATE
+// ============================================
+let audioContext = null;
+let mediaStream = null;
 let sourceNode = null;
+let processorNode = null;
+let isRecording = false;
+let isInitialized = false;
 
 // Callbacks
-let onAudioData = null;  // Called with PCM16 data for STT
-let onError = null;      // Called with error messages
-let stateChangeCallback = null;  // Called when recording state changes
+let stateChangeCallback = null;
+let currentState = 'idle'; // 'idle' | 'listening'
 
-// Current state for state change notifications
-let currentState = 'idle';  // 'idle' | 'listening' | 'recording'
+// ============================================
+// STATE MANAGEMENT
+// ============================================
 
-// ========== State Change Helper ==========
+/**
+ * Update state and notify listeners
+ * @param {string} newState
+ */
 function setState(newState) {
   if (newState !== currentState) {
     const oldState = currentState;
@@ -27,33 +34,6 @@ function setState(newState) {
     if (stateChangeCallback) {
       stateChangeCallback(newState, oldState);
     }
-  }
-}
-
-// ========== Audio Context Management ==========
-function initializeAudioContext() {
-  if (!sttAudioContext || sttAudioContext.state === 'closed') {
-    sttAudioContext = new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: 48000
-    });
-  }
-  return sttAudioContext;
-}
-
-/**
- * Initialize audio capture system
- * Must be called from a user gesture (click/tap)
- * @returns {Promise<boolean>} Success status
- */
-export async function initAudioCapture() {
-  try {
-    const ctx = initializeAudioContext();
-    await ctx.resume();
-    console.log('STT Audio: Audio capture initialized');
-    return true;
-  } catch (error) {
-    console.error('STT Audio: Failed to initialize audio capture:', error);
-    return false;
   }
 }
 
@@ -67,29 +47,72 @@ export function onStateChange(callback) {
   }
 }
 
-// ========== Microphone Capture ==========
-/**
- * Start microphone capture for STT
- * Outputs PCM16 @ 16kHz via callback
- */
-export async function startMicrophone(callback) {
-  if (isRecording) {
-    console.log('STT Audio: Already recording');
-    return;
-  }
+// ============================================
+// AUDIO CONTEXT MANAGEMENT
+// ============================================
 
-  // Store callback
-  if (typeof callback === 'function') {
-    onAudioData = callback;
+/**
+ * Initialize audio context (must be called from user gesture)
+ * @returns {Promise<boolean>} Success status
+ */
+export async function initAudioCapture() {
+  if (isInitialized) {
+    return true;
   }
 
   try {
-    // Initialize audio context
-    const ctx = initializeAudioContext();
-    await ctx.resume();
+    // Create audio context at 48kHz (will be downsampled to 16kHz by processor)
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 48000
+    });
 
-    // Get microphone stream
-    stream = await navigator.mediaDevices.getUserMedia({
+    // Resume context (required after user gesture)
+    await audioContext.resume();
+
+    // Pre-load the AudioWorklet processor
+    await audioContext.audioWorklet.addModule('./stt-processor.js');
+
+    isInitialized = true;
+    console.log('[STT Audio] Initialized');
+    return true;
+
+  } catch (error) {
+    console.error('[STT Audio] Failed to initialize:', error);
+    return false;
+  }
+}
+
+// ============================================
+// RECORDING CONTROL
+// ============================================
+
+/**
+ * Start recording from microphone
+ * Streams PCM16 audio to server via WebSocket
+ */
+export async function startRecording() {
+  if (isRecording) {
+    console.log('[STT Audio] Already recording');
+    return;
+  }
+
+  // Ensure initialized
+  if (!isInitialized) {
+    const success = await initAudioCapture();
+    if (!success) {
+      console.error('[STT Audio] Cannot start - initialization failed');
+      return;
+    }
+  }
+
+  try {
+    // Resume audio context if suspended
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+
+    // Get microphone access
+    mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         echoCancellation: true,
@@ -98,120 +121,118 @@ export async function startMicrophone(callback) {
       }
     });
 
-    // Load STT processor
-    await ctx.audioWorklet.addModule('./stt-processor.js');
-
     // Create audio nodes
-    sourceNode = ctx.createMediaStreamSource(stream);
-    sttProcessor = new AudioWorkletNode(ctx, 'stt-processor', {
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+    processorNode = new AudioWorkletNode(audioContext, 'stt-processor', {
       processorOptions: {
         targetSampleRate: 16000
       }
     });
 
-    // Handle STT data
-    sttProcessor.port.onmessage = (event) => {
-      if (onAudioData) {
-        onAudioData(event.data);
+    // Handle audio data from processor - send to server
+    processorNode.port.onmessage = (event) => {
+      if (isRecording && websocket.isConnected()) {
+        websocket.sendAudio(event.data);
       }
     };
 
-    // Connect audio graph
-    sourceNode.connect(sttProcessor);
+    // Connect: microphone -> processor
+    sourceNode.connect(processorNode);
+
+    // Notify server that we're starting to listen
+    websocket.startListening();
 
     isRecording = true;
     setState('listening');
-    console.log('STT Audio: Recording started');
+    console.log('[STT Audio] Recording started');
 
   } catch (error) {
-    console.error('STT Audio: Failed to start recording:', error);
-
-    // Cleanup on error
-    stopMicrophone();
-
-    if (onError) {
-      onError('Failed to access microphone: ' + error.message);
-    } else {
-      throw error;
-    }
+    console.error('[STT Audio] Failed to start recording:', error);
+    cleanup();
   }
 }
 
 /**
- * Stop microphone capture
+ * Stop recording
  */
-export function stopMicrophone() {
+export function stopRecording() {
   if (!isRecording) {
-    console.log('STT Audio: Not recording');
     return;
   }
 
-  // Cleanup audio nodes
+  // Notify server that we're stopping
+  websocket.stopListening();
+
+  cleanup();
+
+  isRecording = false;
+  setState('idle');
+  console.log('[STT Audio] Recording stopped');
+}
+
+/**
+ * Clean up audio resources (but keep context for reuse)
+ */
+function cleanup() {
   if (sourceNode) {
     sourceNode.disconnect();
     sourceNode = null;
   }
 
-  if (sttProcessor) {
-    sttProcessor.disconnect();
-    sttProcessor = null;
+  if (processorNode) {
+    processorNode.disconnect();
+    processorNode = null;
   }
 
-  // Stop microphone stream
-  if (stream) {
-    stream.getTracks().forEach(track => track.stop());
-    stream = null;
+  if (mediaStream) {
+    mediaStream.getTracks().forEach(track => track.stop());
+    mediaStream = null;
   }
-
-  isRecording = false;
-  setState('idle');
-  console.log('STT Audio: Recording stopped');
 }
 
-// ========== State Getters ==========
-export function getMicrophoneState() {
+// ============================================
+// STATE GETTERS
+// ============================================
+
+/**
+ * Check if currently recording
+ * @returns {boolean}
+ */
+export function getRecordingState() {
   return isRecording;
 }
 
+/**
+ * Get detailed status
+ * @returns {object}
+ */
 export function getStatus() {
   return {
     isRecording,
-    hasAudioContext: !!sttAudioContext,
-    audioContextState: sttAudioContext ? sttAudioContext.state : null,
-    contextSampleRate: sttAudioContext ? sttAudioContext.sampleRate : null
+    isInitialized,
+    audioContextState: audioContext?.state || null,
+    currentState
   };
 }
 
-// ========== Callback Management ==========
-export function setAudioDataCallback(callback) {
-  if (typeof callback === 'function') {
-    onAudioData = callback;
-  }
-}
+// ============================================
+// FULL CLEANUP
+// ============================================
 
-export function setErrorCallback(callback) {
-  if (typeof callback === 'function') {
-    onError = callback;
-  }
-}
+/**
+ * Full cleanup including audio context
+ * Call when leaving the page
+ */
+export function destroy() {
+  stopRecording();
 
-// ========== Cleanup ==========
-export function cleanup() {
-  stopMicrophone();
-
-  if (sttAudioContext && sttAudioContext.state !== 'closed') {
-    sttAudioContext.close();
+  if (audioContext && audioContext.state !== 'closed') {
+    audioContext.close();
   }
 
-  sttAudioContext = null;
-  onAudioData = null;
-  onError = null;
+  audioContext = null;
+  isInitialized = false;
   stateChangeCallback = null;
-  setState('idle');
 
-  console.log('STT Audio: Cleanup complete');
+  console.log('[STT Audio] Destroyed');
 }
-
-// ========== Aliases for editor.js compatibility ==========
-export const startRecording = startMicrophone;
-export const stopRecording = stopMicrophone;

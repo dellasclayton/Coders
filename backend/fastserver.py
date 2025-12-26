@@ -61,6 +61,8 @@ class TTSSentence:
     character_name: str
     voice_id: str
     is_final: bool = False
+    is_first_sentence: bool = False
+    queued_at: float = field(default_factory=time.time)
 
 @dataclass
 class AudioChunk:
@@ -72,6 +74,19 @@ class AudioChunk:
     character_id: str
     character_name: str
     is_final: bool = False
+
+@dataclass
+class ChunkSizeSchedule:
+    """Adaptive chunk sizes for progressive audio decoding to reduce TTFA"""
+    first_sentence_schedule: List[int] = field(default_factory=lambda: [4, 6, 10, 14])
+    default_chunk_size: int = 14
+
+    def get_chunk_size(self, is_first_sentence: bool, chunk_index: int) -> int:
+        """Get chunk size based on sentence position and chunk index"""
+        if is_first_sentence:
+            if chunk_index < len(self.first_sentence_schedule):
+                return self.first_sentence_schedule[chunk_index]
+        return self.default_chunk_size
 
 @dataclass
 class ModelSettings:
@@ -446,6 +461,7 @@ class ChatLLM:
                         character_name=character.name,
                         voice_id=character.voice,
                         is_final=False,
+                        is_first_sentence=(sentence_index == 0),
                     ))
                     logger.info(f"[LLM] {character.name} sentence {sentence_index}: {sentence_text[:50]}...")
                     sentence_index += 1
@@ -461,6 +477,7 @@ class ChatLLM:
             character_name=character.name,
             voice_id=character.voice,
             is_final=True,
+            is_first_sentence=False,
         ))
         logger.info(f"[LLM] {character.name} complete: {sentence_index} sentences")
 
@@ -493,8 +510,16 @@ class Speech:
         self._task: Optional[asyncio.Task] = None
 
         self.sample_rate = 24000
-        self._chunk_size = 14
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Adaptive chunk size schedule for reduced TTFA
+        self.chunk_schedule = ChunkSizeSchedule(
+            first_sentence_schedule=[4, 6, 10, 14],
+            default_chunk_size=14
+        )
+
+        # TTFA metrics tracking
+        self._ttfa_metrics: List[Dict[str, Any]] = []
 
         self.voice_dir = "backend/voices"
 
@@ -507,6 +532,53 @@ class Speech:
         )
 
         logger.info("Higgs Audio TTS initialized")
+
+    def log_ttfa_metric(self, message_id: str, sentence_index: int,
+                        is_first_sentence: bool, queued_at: float,
+                        first_audio_at: float, chunk_size_used: int):
+        """Log TTFA metric for analysis"""
+        ttfa_ms = (first_audio_at - queued_at) * 1000
+        metric = {
+            "message_id": message_id,
+            "sentence_index": sentence_index,
+            "is_first_sentence": is_first_sentence,
+            "ttfa_ms": round(ttfa_ms, 2),
+            "first_chunk_size": chunk_size_used,
+            "timestamp": datetime.now().isoformat()
+        }
+        self._ttfa_metrics.append(metric)
+
+        # Keep only last 100 metrics
+        if len(self._ttfa_metrics) > 100:
+            self._ttfa_metrics = self._ttfa_metrics[-100:]
+
+        logger.info(f"[TTFA] {'FIRST' if is_first_sentence else 'sent'} #{sentence_index}: "
+                    f"{ttfa_ms:.1f}ms (chunk_size={chunk_size_used})")
+
+    def get_ttfa_stats(self) -> Dict[str, Any]:
+        """Get TTFA statistics summary"""
+        if not self._ttfa_metrics:
+            return {"count": 0, "message": "No TTFA metrics recorded yet"}
+
+        first_sentence_metrics = [m for m in self._ttfa_metrics if m["is_first_sentence"]]
+        other_metrics = [m for m in self._ttfa_metrics if not m["is_first_sentence"]]
+
+        def calc_stats(metrics: List[Dict]) -> Dict[str, float]:
+            if not metrics:
+                return {"count": 0}
+            ttfa_values = [m["ttfa_ms"] for m in metrics]
+            return {
+                "count": len(metrics),
+                "avg_ms": round(sum(ttfa_values) / len(ttfa_values), 2),
+                "min_ms": round(min(ttfa_values), 2),
+                "max_ms": round(max(ttfa_values), 2)
+            }
+
+        return {
+            "first_sentence": calc_stats(first_sentence_metrics),
+            "other_sentences": calc_stats(other_metrics),
+            "total_samples": len(self._ttfa_metrics)
+        }
 
     async def start(self):
         """Start TTS Worker"""
@@ -551,11 +623,19 @@ class Speech:
                 continue
 
             # Generate audio for this sentence
-            logger.info(f"[TTS] Generating audio for sentence {sentence.index}")
+            logger.info(f"[TTS] Generating audio for sentence {sentence.index} "
+                        f"(first={sentence.is_first_sentence})")
 
             chunk_index = 0
             try:
-                async for pcm_bytes in self.generate_audio_for_sentence(sentence.text, sentence.voice_id):
+                async for pcm_bytes in self.generate_audio_for_sentence(
+                    text=sentence.text,
+                    voice=sentence.voice_id,
+                    is_first_sentence=sentence.is_first_sentence,
+                    queued_at=sentence.queued_at,
+                    message_id=sentence.message_id,
+                    sentence_index=sentence.index
+                ):
                     audio_chunk = AudioChunk(
                         audio_bytes=pcm_bytes,
                         sentence_index=sentence.index,
@@ -590,8 +670,11 @@ class Speech:
 
         return messages
 
-    async def generate_audio_for_sentence(self, text: str, voice: str) -> AsyncGenerator[bytes, None]:
-        """Generate audio for text using Higgs streaming"""
+    async def generate_audio_for_sentence(
+        self, text: str, voice: str, is_first_sentence: bool = False, queued_at: float = 0.0,
+        message_id: str = "", sentence_index: int = 0
+    ) -> AsyncGenerator[bytes, None]:
+        """Generate audio for text using Higgs streaming with adaptive chunk sizes"""
 
         messages = self.load_voice_reference(voice)
         messages.append(Message(role="user", content=text))
@@ -601,6 +684,10 @@ class Speech:
         # Initialize streaming state
         audio_tokens: list[torch.Tensor] = []
         seq_len = 0
+        chunk_decode_index = 0
+        tokens_since_last_decode = 0
+        last_decode_seq_len = 0
+        first_audio_yielded = False
 
         with torch.inference_mode():
             async for delta in self.engine.generate_delta_stream(
@@ -626,14 +713,21 @@ class Speech:
                 # Count non-padding tokens (1024 is padding)
                 if torch.all(delta.audio_tokens != 1024):
                     seq_len += 1
+                    tokens_since_last_decode += 1
 
-                # Decode when chunk size reached
-                if seq_len > 0 and seq_len % self._chunk_size == 0:
+                # Get adaptive chunk size based on position
+                target_chunk_size = self.chunk_schedule.get_chunk_size(
+                    is_first_sentence, chunk_decode_index
+                )
+
+                # Decode when target chunk size reached
+                if tokens_since_last_decode >= target_chunk_size:
                     audio_tensor = torch.cat(audio_tokens, dim=-1)
 
                     try:
                         # Revert delay pattern and decode
-                        vq_code = (revert_delay_pattern(audio_tensor, start_idx=seq_len - self._chunk_size + 1).clip(0, 1023).to(self._device))
+                        start_idx = last_decode_seq_len + 1 if last_decode_seq_len > 0 else 1
+                        vq_code = (revert_delay_pattern(audio_tensor, start_idx=start_idx).clip(0, 1023).to(self._device))
                         waveform = self.engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 
                         # Convert to numpy
@@ -645,19 +739,38 @@ class Speech:
                         # Convert to PCM16 bytes
                         pcm = np.clip(waveform_np, -1.0, 1.0)
                         pcm16 = (pcm * 32767.0).astype(np.int16)
+
+                        # Log TTFA for first audio chunk
+                        if not first_audio_yielded:
+                            first_audio_yielded = True
+                            if queued_at > 0:
+                                self.log_ttfa_metric(
+                                    message_id=message_id,
+                                    sentence_index=sentence_index,
+                                    is_first_sentence=is_first_sentence,
+                                    queued_at=queued_at,
+                                    first_audio_at=time.time(),
+                                    chunk_size_used=target_chunk_size
+                                )
+
                         yield pcm16.tobytes()
+
+                        # Update tracking for next chunk
+                        last_decode_seq_len = seq_len
+                        tokens_since_last_decode = 0
+                        chunk_decode_index += 1
 
                     except Exception as e:
                         logger.warning(f"Error decoding chunk: {e}")
                         continue
 
         # Flush remaining tokens
-        if seq_len > 0 and seq_len % self._chunk_size != 0 and audio_tokens:
+        if tokens_since_last_decode > 0 and audio_tokens:
             audio_tensor = torch.cat(audio_tokens, dim=-1)
-            remaining = seq_len % self._chunk_size
 
             try:
-                vq_code = (revert_delay_pattern(audio_tensor, start_idx=seq_len - remaining + 1).clip(0, 1023).to(self._device))
+                start_idx = last_decode_seq_len + 1 if last_decode_seq_len > 0 else 1
+                vq_code = (revert_delay_pattern(audio_tensor, start_idx=start_idx).clip(0, 1023).to(self._device))
                 waveform = self.engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 
                 if isinstance(waveform, torch.Tensor):
@@ -667,6 +780,18 @@ class Speech:
 
                 pcm = np.clip(waveform_np, -1.0, 1.0)
                 pcm16 = (pcm * 32767.0).astype(np.int16)
+
+                # Log TTFA if this is the first (and only) chunk
+                if not first_audio_yielded and queued_at > 0:
+                    self.log_ttfa_metric(
+                        message_id=message_id,
+                        sentence_index=sentence_index,
+                        is_first_sentence=is_first_sentence,
+                        queued_at=queued_at,
+                        first_audio_at=time.time(),
+                        chunk_size_used=tokens_since_last_decode
+                    )
+
                 yield pcm16.tobytes()
 
             except Exception as e:
@@ -1064,6 +1189,17 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await ws_manager.disconnect()
+
+########################################
+##--         TTFA Metrics API       --##
+########################################
+
+@app.get("/api/ttfa-stats")
+async def get_ttfa_stats():
+    """Get Time-to-First-Audio statistics"""
+    if ws_manager.speech:
+        return ws_manager.speech.get_ttfa_stats()
+    return {"error": "Speech engine not initialized"}
 
 ########################################
 ##--           Run Server           --##

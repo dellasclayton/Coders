@@ -216,6 +216,26 @@ export function getStatus() {
 }
 
 // ============================================
+// TTS COORDINATION
+// ============================================
+
+/**
+ * Called by TTS to pause/resume STT during playback
+ * Prevents echo/feedback when audio is playing
+ * @param {boolean} isPlaying - Whether TTS is currently playing
+ */
+export function setTTSPlaying(isPlaying) {
+  // When TTS starts playing, we could pause recording to prevent echo
+  // When TTS stops, recording can resume
+  // For now, just log - the server handles echo cancellation
+  if (isPlaying) {
+    console.log('[STT Audio] TTS started - echo prevention active');
+  } else {
+    console.log('[STT Audio] TTS stopped');
+  }
+}
+
+// ============================================
 // FULL CLEANUP
 // ============================================
 

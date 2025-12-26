@@ -1,316 +1,185 @@
-/**
- * stt-audio.js - Audio Input Capture for STT
- * Handles microphone capture and audio streaming to server
- *
- * Note: VAD is handled by backend RealtimeSTT (Silero/WebRTC)
- * This module continuously streams audio when active
- */
-
-import * as websocket from './websocket.js'
-
 // ============================================
-// STATE
+// STT AUDIO - Microphone Capture Module
 // ============================================
-const state = {
-  audioContext: null,
-  mediaStream: null,
-  workletNode: null,
-  sourceNode: null,
-  status: 'idle', // 'idle' | 'recording' | 'paused'
-  isTTSPlaying: false,
-  stateListeners: new Set(),
+
+// ========== State Variables ==========
+let sttAudioContext = null;
+let stream = null;
+let isRecording = false;
+
+// STT (microphone capture)
+let sttProcessor = null;
+let sourceNode = null;
+
+// Callbacks
+let onAudioData = null;  // Called with PCM16 data for STT
+let onError = null;      // Called with error messages
+
+// ========== Audio Context Management ==========
+function initializeAudioContext() {
+  if (!sttAudioContext || sttAudioContext.state === 'closed') {
+    sttAudioContext = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: 48000
+    });
+  }
+  return sttAudioContext;
 }
 
-// ============================================
-// CONFIGURATION
-// ============================================
-const config = {
-  // Use browser's native sample rate (typically 48kHz)
-  // Processor handles downsampling to 16kHz for STT
-  sampleRate: 48000,
-  channelCount: 1,
-}
-
-// ============================================
-// INITIALIZATION
-// ============================================
-
+// ========== Microphone Capture ==========
 /**
- * Initialize audio capture system
- * @returns {Promise<boolean>} - True if initialized successfully
+ * Start microphone capture for STT
+ * Outputs PCM16 @ 16kHz via callback
  */
-export async function initAudioCapture() {
+async function startMicrophone(callback) {
+  if (isRecording) {
+    console.log('STT Audio: Already recording');
+    return;
+  }
+
+  // Store callback
+  if (typeof callback === 'function') {
+    onAudioData = callback;
+  }
+
   try {
-    // Request microphone access
-    state.mediaStream = await navigator.mediaDevices.getUserMedia({
+    // Initialize audio context
+    const ctx = initializeAudioContext();
+    await ctx.resume();
+
+    // Get microphone stream
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        channelCount: config.channelCount,
+        channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,
+        autoGainControl: true
       }
-    })
+    });
 
-    // Create audio context at native sample rate
-    state.audioContext = new AudioContext({
-      sampleRate: config.sampleRate,
-    })
+    // Load STT processor
+    await ctx.audioWorklet.addModule('./stt-processor.js');
 
-    // Load AudioWorklet processor
-    const processorUrl = new URL('./stt-processor.js', import.meta.url)
-    await state.audioContext.audioWorklet.addModule(processorUrl)
+    // Create audio nodes
+    sourceNode = ctx.createMediaStreamSource(stream);
+    sttProcessor = new AudioWorkletNode(ctx, 'stt-processor', {
+      processorOptions: {
+        targetSampleRate: 16000
+      }
+    });
 
-    // Create worklet node
-    state.workletNode = new AudioWorkletNode(
-      state.audioContext,
-      'stt-processor'
-    )
+    // Handle STT data
+    sttProcessor.port.onmessage = (event) => {
+      if (onAudioData) {
+        onAudioData(event.data);
+      }
+    };
 
-    // Connect audio pipeline
-    state.sourceNode = state.audioContext.createMediaStreamSource(state.mediaStream)
-    state.sourceNode.connect(state.workletNode)
+    // Connect audio graph
+    sourceNode.connect(sttProcessor);
 
-    // Handle audio data from worklet
-    state.workletNode.port.onmessage = handleWorkletMessage
-
-    console.log('[STT] Audio capture initialized')
-    return true
+    isRecording = true;
+    console.log('STT Audio: Recording started');
 
   } catch (error) {
-    console.error('[STT] Failed to initialize audio capture:', error)
-    return false
-  }
-}
+    console.error('STT Audio: Failed to start recording:', error);
 
-/**
- * Check if audio is initialized
- * @returns {boolean}
- */
-export function isInitialized() {
-  return state.audioContext !== null && state.workletNode !== null
-}
+    // Cleanup on error
+    stopMicrophone();
 
-// ============================================
-// RECORDING CONTROL
-// ============================================
-
-/**
- * Start recording - begins streaming audio to server
- */
-export function startRecording() {
-  if (!isInitialized()) {
-    console.warn('[STT] Not initialized')
-    return
-  }
-
-  if (state.status === 'recording') {
-    return
-  }
-
-  // Resume audio context if suspended
-  if (state.audioContext.state === 'suspended') {
-    state.audioContext.resume()
-  }
-
-  // If TTS is playing, go to paused state and wait
-  if (state.isTTSPlaying) {
-    setStatus('paused')
-    console.log('[STT] TTS playing - will start when finished')
-    return
-  }
-
-  // Enable mic track (in case it was muted)
-  setMicEnabled(true)
-
-  // Start the processor
-  state.workletNode.port.postMessage({ command: 'start' })
-
-  // Tell server we're starting
-  websocket.startListening()
-
-  setStatus('recording')
-  console.log('[STT] Recording started')
-}
-
-/**
- * Stop recording completely
- */
-export function stopRecording() {
-  if (!isInitialized()) return
-
-  // Stop the processor
-  state.workletNode.port.postMessage({ command: 'stop' })
-
-  // Tell server we're stopping
-  websocket.stopListening()
-
-  setStatus('idle')
-  console.log('[STT] Recording stopped')
-}
-
-/**
- * Check if currently recording
- * @returns {boolean}
- */
-export function isRecording() {
-  return state.status === 'recording'
-}
-
-/**
- * Check if active (recording or paused waiting for TTS)
- * @returns {boolean}
- */
-export function isActive() {
-  return state.status === 'recording' || state.status === 'paused'
-}
-
-/**
- * Get current status
- * @returns {string}
- */
-export function getStatus() {
-  return state.status
-}
-
-// ============================================
-// TTS COORDINATION (Echo Prevention)
-// ============================================
-
-/**
- * Set TTS playing state - handles pause/resume and echo prevention
- * Called by tts-audio.js when playback starts/stops
- * @param {boolean} isPlaying
- */
-export function setTTSPlaying(isPlaying) {
-  state.isTTSPlaying = isPlaying
-
-  if (isPlaying) {
-    // TTS starting - pause recording and mute mic to prevent echo
-    if (state.status === 'recording') {
-      // Pause the processor
-      state.workletNode?.port.postMessage({ command: 'pause' })
-
-      // Mute mic track to prevent TTS audio feedback
-      setMicEnabled(false)
-
-      setStatus('paused')
-      console.log('[STT] Paused for TTS (mic muted)')
-    }
-  } else {
-    // TTS finished - resume recording if we were paused
-    if (state.status === 'paused') {
-      // Re-enable mic track
-      setMicEnabled(true)
-
-      // Resume the processor
-      state.workletNode?.port.postMessage({ command: 'resume' })
-
-      setStatus('recording')
-      console.log('[STT] Resumed after TTS (mic enabled)')
+    if (onError) {
+      onError('Failed to access microphone: ' + error.message);
+    } else {
+      throw error;
     }
   }
 }
 
 /**
- * Enable/disable microphone track (for echo prevention)
- * @param {boolean} enabled
+ * Stop microphone capture
  */
-function setMicEnabled(enabled) {
-  if (state.mediaStream) {
-    state.mediaStream.getAudioTracks().forEach(track => {
-      track.enabled = enabled
-    })
+function stopMicrophone() {
+  if (!isRecording) {
+    console.log('STT Audio: Not recording');
+    return;
+  }
+
+  // Cleanup audio nodes
+  if (sourceNode) {
+    sourceNode.disconnect();
+    sourceNode = null;
+  }
+
+  if (sttProcessor) {
+    sttProcessor.disconnect();
+    sttProcessor = null;
+  }
+
+  // Stop microphone stream
+  if (stream) {
+    stream.getTracks().forEach(track => track.stop());
+    stream = null;
+  }
+
+  isRecording = false;
+  console.log('STT Audio: Recording stopped');
+}
+
+// ========== State Getters ==========
+function getMicrophoneState() {
+  return isRecording;
+}
+
+function getStatus() {
+  return {
+    isRecording,
+    hasAudioContext: !!sttAudioContext,
+    audioContextState: sttAudioContext ? sttAudioContext.state : null,
+    contextSampleRate: sttAudioContext ? sttAudioContext.sampleRate : null
+  };
+}
+
+// ========== Callback Management ==========
+function setAudioDataCallback(callback) {
+  if (typeof callback === 'function') {
+    onAudioData = callback;
   }
 }
 
-// ============================================
-// WORKLET MESSAGE HANDLING
-// ============================================
-
-/**
- * Handle messages from AudioWorklet processor
- * @param {MessageEvent} event
- */
-function handleWorkletMessage(event) {
-  const { type, data } = event.data
-
-  if (type === 'audio') {
-    // data is Int16Array - send to server as binary
-    websocket.sendAudio(data.buffer)
+function setErrorCallback(callback) {
+  if (typeof callback === 'function') {
+    onError = callback;
   }
 }
 
-// ============================================
-// STATE MANAGEMENT
-// ============================================
+// ========== Cleanup ==========
+function cleanup() {
+  stopMicrophone();
 
-/**
- * Set status and notify listeners
- * @param {string} newStatus
- */
-function setStatus(newStatus) {
-  const oldStatus = state.status
-  state.status = newStatus
-
-  if (oldStatus !== newStatus) {
-    notifyStateListeners(newStatus, oldStatus)
+  if (sttAudioContext && sttAudioContext.state !== 'closed') {
+    sttAudioContext.close();
   }
+
+  sttAudioContext = null;
+  onAudioData = null;
+  onError = null;
+
+  console.log('STT Audio: Cleanup complete');
 }
 
-/**
- * Register state change listener
- * @param {Function} handler - Callback(newStatus, oldStatus)
- * @returns {Function} - Unsubscribe function
- */
-export function onStateChange(handler) {
-  state.stateListeners.add(handler)
-  return () => state.stateListeners.delete(handler)
-}
+// ========== Public API Export ==========
+window.STTAudio = {
+  // Microphone control
+  startMicrophone,
+  stopMicrophone,
 
-/**
- * Notify all state listeners
- * @param {string} newStatus
- * @param {string} oldStatus
- */
-function notifyStateListeners(newStatus, oldStatus) {
-  state.stateListeners.forEach(handler => {
-    try {
-      handler(newStatus, oldStatus)
-    } catch (error) {
-      console.error('[STT] State listener error:', error)
-    }
-  })
-}
+  // State
+  getMicrophoneState,
+  getStatus,
 
-// ============================================
-// CLEANUP
-// ============================================
+  // Callbacks
+  setAudioDataCallback,
+  setErrorCallback,
 
-/**
- * Cleanup audio resources
- */
-export function cleanup() {
-  stopRecording()
-
-  if (state.sourceNode) {
-    state.sourceNode.disconnect()
-    state.sourceNode = null
-  }
-
-  if (state.workletNode) {
-    state.workletNode.disconnect()
-    state.workletNode = null
-  }
-
-  if (state.mediaStream) {
-    state.mediaStream.getTracks().forEach(track => track.stop())
-    state.mediaStream = null
-  }
-
-  if (state.audioContext) {
-    state.audioContext.close()
-    state.audioContext = null
-  }
-
-  console.log('[STT] Cleaned up')
-}
+  // Cleanup
+  cleanup
+};

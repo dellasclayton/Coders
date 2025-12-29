@@ -287,22 +287,12 @@ class ChatLLM:
 
         return f"<{character_name}>{text}</{character_name}>"
 
-    def strip_character_tags(self, text: str, character_name: str) -> str:
-        """Strip character XML tags from text for UI display and TTS."""
-
-        # Remove opening tag <CharacterName>
-        text = re.sub(rf'<{re.escape(character_name)}>', '', text, flags=re.IGNORECASE)
-        # Remove closing tag </CharacterName>
-        text = re.sub(rf'</{re.escape(character_name)}>', '', text, flags=re.IGNORECASE)
-
-        return text
-
     def character_instruction_message(self, character: Character) -> Dict[str, str]:
         """Create character instruction message for group chat with character tags."""
 
         return {
             'role': 'system',
-            'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else. Wrap your entire response in <{character.name}></{character.name}> tags.'
+            'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else.'
         }
 
     def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
@@ -440,13 +430,12 @@ class ChatLLM:
                                                                  on_text_chunk=on_text_chunk)
             
             if on_text_stream_stop:
-                # Send clean text (without tags) to UI
-                clean_response = self.strip_character_tags(full_response, character.name)
-                await on_text_stream_stop(character, message_id, clean_response)
+                await on_text_stream_stop(character, message_id, full_response)
 
             if full_response:
-                # Store raw response with tags in conversation history
-                self.conversation_history.append({"role": "assistant", "name": character.name, "content": full_response})
+                response_wrapped = self.wrap_character_tags(full_response, character.name)
+
+                self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_wrapped})
 
     async def stream_character_response(self, messages: List[Dict[str, str]], character: Character, message_id: str,
                                         model_settings: ModelSettings, sentence_queue: asyncio.Queue,
@@ -475,51 +464,39 @@ class ChatLLM:
                 }
             )
 
-            # Track clean text sent to UI (for computing deltas when stripping tags)
-            clean_sent_length = 0
-
             async def chunk_generator() -> AsyncGenerator[str, None]:
-                nonlocal full_response, clean_sent_length
+                nonlocal full_response
                 async for chunk in stream:
                     if chunk.choices and chunk.choices[0].delta:
                         content = chunk.choices[0].delta.content
                         if content:
                             full_response += content
-
-                            # Send clean (tag-stripped) delta to UI
                             if on_text_chunk:
-                                clean_response = self.strip_character_tags(full_response, character.name)
-                                clean_delta = clean_response[clean_sent_length:]
-                                if clean_delta:
-                                    await on_text_chunk(clean_delta, character, message_id)
-                                clean_sent_length = len(clean_response)
-
+                                await on_text_chunk(content, character, message_id)
                             yield content
 
             async for sentence in generate_sentences_async(
                 chunk_generator(),
-                minimum_first_fragment_length=10,
-                minimum_sentence_length=15,
+                minimum_first_fragment_length=4,
+                minimum_sentence_length=25,
+                tokenizer="nltk",
                 quick_yield_single_sentence_fragment=True,
                 sentence_fragment_delimiters=".?!;:,\n…)]}。-",
                 full_sentence_delimiters=".?!\n…。",
             ):
                 sentence_text = sentence.strip()
                 if sentence_text:
-                    # Strip character tags for TTS
-                    clean_sentence = self.strip_character_tags(sentence_text, character.name)
-                    if clean_sentence:
-                        await sentence_queue.put(TTSSentence(
-                            text=clean_sentence,
-                            index=sentence_index,
-                            message_id=message_id,
-                            character_id=character.id,
-                            character_name=character.name,
-                            voice_id=character.voice,
-                            is_final=False,
-                        ))
-                        logger.info(f"[LLM] {character.name} sentence {sentence_index}: {clean_sentence[:50]}...")
-                        sentence_index += 1
+                    await sentence_queue.put(TTSSentence(
+                        text=sentence_text,
+                        index=sentence_index,
+                        message_id=message_id,
+                        character_id=character.id,
+                        character_name=character.name,
+                        voice_id=character.voice,
+                        is_final=False,
+                    ))
+                    logger.info(f"[LLM] {character.name} sentence {sentence_index}: {sentence_text[:50]}...")
+                    sentence_index += 1
 
         except Exception as e:
             logger.error(f"[LLM] Error streaming for {character.name}: {e}")
@@ -676,6 +653,7 @@ class Speech:
         with torch.inference_mode():
             async for delta in self.engine.generate_delta_stream(
                 chat_ml_sample=chat_sample,
+                max_new_tokens=2048,
                 temperature=0.7,
                 top_p=0.95,
                 top_k=50,
@@ -793,7 +771,7 @@ class WebSocketManager:
     async def initialize(self): # <============================= boom
         """Initialize all pipeline components at startup"""
         
-        api_key = os.getenv("OPENROUTER_API_KEY", "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")
+        api_key = os.getenv("OPENROUTER_API_KEY", "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")
 
         self.transcribe = Transcribe(on_transcription_update=self.on_transcription_update,
                                      on_transcription_stabilized=self.on_transcription_stabilized,
@@ -1144,4 +1122,3 @@ app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

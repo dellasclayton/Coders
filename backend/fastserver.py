@@ -61,8 +61,6 @@ class TTSSentence:
     character_name: str
     voice_id: str
     is_final: bool = False
-    is_first_sentence: bool = False
-    queued_at: float = field(default_factory=time.time)
 
 @dataclass
 class AudioChunk:
@@ -74,18 +72,6 @@ class AudioChunk:
     character_id: str
     character_name: str
     is_final: bool = False
-
-@dataclass
-class ChunkSizeSchedule:
-    """Adaptive chunk sizes for progressive audio decoding to reduce TTFA"""
-    first_chunk_size: int = 4      # First chunk of first sentence only
-    default_chunk_size: int = 14   # All other chunks
-
-    def get_chunk_size(self, is_first_sentence: bool, chunk_index: int) -> int:
-        """Get chunk size based on sentence position and chunk index"""
-        if is_first_sentence and chunk_index == 0:
-            return self.first_chunk_size
-        return self.default_chunk_size
 
 @dataclass
 class ModelSettings:
@@ -460,7 +446,6 @@ class ChatLLM:
                         character_name=character.name,
                         voice_id=character.voice,
                         is_final=False,
-                        is_first_sentence=(sentence_index == 0),
                     ))
                     logger.info(f"[LLM] {character.name} sentence {sentence_index}: {sentence_text[:50]}...")
                     sentence_index += 1
@@ -476,7 +461,6 @@ class ChatLLM:
             character_name=character.name,
             voice_id=character.voice,
             is_final=True,
-            is_first_sentence=False,
         ))
         logger.info(f"[LLM] {character.name} complete: {sentence_index} sentences")
 
@@ -509,10 +493,8 @@ class Speech:
         self._task: Optional[asyncio.Task] = None
 
         self.sample_rate = 24000
+        self._chunk_size = 14
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Adaptive chunk size schedule for reduced TTFA
-        self.chunk_schedule = ChunkSizeSchedule()
 
         self.voice_dir = "backend/voices"
 
@@ -573,12 +555,7 @@ class Speech:
 
             chunk_index = 0
             try:
-                async for pcm_bytes in self.generate_audio_for_sentence(
-                    text=sentence.text,
-                    voice=sentence.voice_id,
-                    is_first_sentence=sentence.is_first_sentence,
-                    queued_at=sentence.queued_at
-                ):
+                async for pcm_bytes in self.generate_audio_for_sentence(sentence.text, sentence.voice_id):
                     audio_chunk = AudioChunk(
                         audio_bytes=pcm_bytes,
                         sentence_index=sentence.index,
@@ -613,10 +590,8 @@ class Speech:
 
         return messages
 
-    async def generate_audio_for_sentence(
-        self, text: str, voice: str, is_first_sentence: bool = False, queued_at: float = 0.0
-    ) -> AsyncGenerator[bytes, None]:
-        """Generate audio for text using Higgs streaming with adaptive chunk sizes"""
+    async def generate_audio_for_sentence(self, text: str, voice: str) -> AsyncGenerator[bytes, None]:
+        """Generate audio for text using Higgs streaming"""
 
         messages = self.load_voice_reference(voice)
         messages.append(Message(role="user", content=text))
@@ -626,10 +601,6 @@ class Speech:
         # Initialize streaming state
         audio_tokens: list[torch.Tensor] = []
         seq_len = 0
-        chunk_decode_index = 0
-        tokens_since_last_decode = 0
-        last_yielded_samples = 0
-        first_audio_yielded = False
 
         with torch.inference_mode():
             async for delta in self.engine.generate_delta_stream(
@@ -655,20 +626,14 @@ class Speech:
                 # Count non-padding tokens (1024 is padding)
                 if torch.all(delta.audio_tokens != 1024):
                     seq_len += 1
-                    tokens_since_last_decode += 1
 
-                # Get adaptive chunk size based on position
-                target_chunk_size = self.chunk_schedule.get_chunk_size(
-                    is_first_sentence, chunk_decode_index
-                )
-
-                # Decode when target chunk size reached
-                if tokens_since_last_decode >= target_chunk_size:
+                # Decode when chunk size reached
+                if seq_len > 0 and seq_len % self._chunk_size == 0:
                     audio_tensor = torch.cat(audio_tokens, dim=-1)
 
                     try:
-                        # Decode full tensor and extract only new samples
-                        vq_code = revert_delay_pattern(audio_tensor, start_idx=1).clip(0, 1023).to(self._device)
+                        # Revert delay pattern and decode
+                        vq_code = (revert_delay_pattern(audio_tensor, start_idx=seq_len - self._chunk_size + 1).clip(0, 1023).to(self._device))
                         waveform = self.engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 
                         # Convert to numpy
@@ -677,37 +642,22 @@ class Speech:
                         else:
                             waveform_np = np.asarray(waveform, dtype=np.float32)
 
-                        # Extract only new samples since last yield
-                        new_samples = waveform_np[last_yielded_samples:]
-                        last_yielded_samples = len(waveform_np)
-
                         # Convert to PCM16 bytes
-                        pcm = np.clip(new_samples, -1.0, 1.0)
+                        pcm = np.clip(waveform_np, -1.0, 1.0)
                         pcm16 = (pcm * 32767.0).astype(np.int16)
-
-                        # Log TTFA for first audio of first sentence only
-                        if not first_audio_yielded:
-                            first_audio_yielded = True
-                            if is_first_sentence and queued_at > 0:
-                                ttfa_ms = (time.time() - queued_at) * 1000
-                                logger.info(f"[TTFA] {ttfa_ms:.1f}ms")
-
                         yield pcm16.tobytes()
-
-                        tokens_since_last_decode = 0
-                        chunk_decode_index += 1
 
                     except Exception as e:
                         logger.warning(f"Error decoding chunk: {e}")
                         continue
 
         # Flush remaining tokens
-        if tokens_since_last_decode > 0 and audio_tokens:
+        if seq_len > 0 and seq_len % self._chunk_size != 0 and audio_tokens:
             audio_tensor = torch.cat(audio_tokens, dim=-1)
+            remaining = seq_len % self._chunk_size
 
             try:
-                # Decode full tensor and extract only remaining samples
-                vq_code = revert_delay_pattern(audio_tensor, start_idx=1).clip(0, 1023).to(self._device)
+                vq_code = (revert_delay_pattern(audio_tensor, start_idx=seq_len - remaining + 1).clip(0, 1023).to(self._device))
                 waveform = self.engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 
                 if isinstance(waveform, torch.Tensor):
@@ -715,19 +665,9 @@ class Speech:
                 else:
                     waveform_np = np.asarray(waveform, dtype=np.float32)
 
-                # Extract only new samples since last yield
-                new_samples = waveform_np[last_yielded_samples:]
-
-                if len(new_samples) > 0:
-                    pcm = np.clip(new_samples, -1.0, 1.0)
-                    pcm16 = (pcm * 32767.0).astype(np.int16)
-
-                    # Log TTFA if this is the first (and only) chunk of first sentence
-                    if not first_audio_yielded and is_first_sentence and queued_at > 0:
-                        ttfa_ms = (time.time() - queued_at) * 1000
-                        logger.info(f"[TTFA] {ttfa_ms:.1f}ms")
-
-                    yield pcm16.tobytes()
+                pcm = np.clip(waveform_np, -1.0, 1.0)
+                pcm16 = (pcm * 32767.0).astype(np.int16)
+                yield pcm16.tobytes()
 
             except Exception as e:
                 logger.warning(f"Error flushing remaining audio: {e}")

@@ -359,6 +359,50 @@ class ChatLLM:
         messages.append(self.character_instruction_message(character))
 
         return messages
+
+    def save_conversation_context(self, messages: List[Dict[str, str]], character: Character, model_settings: ModelSettings) -> str:
+        """Save the full conversation context to a JSON file for debugging.
+
+        Returns the filepath of the saved file.
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"conversation_context_{timestamp}.json"
+        filepath = os.path.join("backend", filename)
+
+        # Build the full request payload for inspection
+        context_data = {
+            "timestamp": datetime.now().isoformat(),
+            "character": {
+                "id": character.id,
+                "name": character.name,
+            },
+            "model_settings": {
+                "model": model_settings.model,
+                "temperature": model_settings.temperature,
+                "top_p": model_settings.top_p,
+                "min_p": model_settings.min_p,
+                "top_k": model_settings.top_k,
+                "frequency_penalty": model_settings.frequency_penalty,
+                "presence_penalty": model_settings.presence_penalty,
+                "repetition_penalty": model_settings.repetition_penalty,
+            },
+            "messages": [
+                {
+                    "role": msg.get("role", ""),
+                    "name": msg.get("name", ""),
+                    "content": msg.get("content", "")
+                }
+                for msg in messages
+            ],
+            "message_count": len(messages),
+            "conversation_history_count": len(self.conversation_history),
+        }
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(context_data, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"[DEBUG] Saved conversation context to: {filepath}")
+        return filepath
     
     async def process_message_prompt(self, user_message: str, sentence_queue: asyncio.Queue, 
                                     on_text_chunk: Optional[Callable[[str, Character, str], Awaitable[None]]] = None,
@@ -397,9 +441,12 @@ class ChatLLM:
                                         model_settings: ModelSettings, sentence_queue: asyncio.Queue,
                                         on_text_chunk: Optional[Callable[[str, Character, str], Awaitable[None]]] = None) -> str:
         """Stream LLM response for a character, extract sentences, queue for TTS."""
-        
+
         sentence_index = 0
         full_response = ""
+
+        # Save conversation context to JSON file for debugging
+        self.save_conversation_context(messages, character, model_settings)
 
         try:
             stream = await self.client.chat.completions.create(

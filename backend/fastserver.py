@@ -287,6 +287,16 @@ class ChatLLM:
 
         return f"<{character_name}>{text}</{character_name}>"
 
+    def strip_character_tags(self, text: str, character_name: str) -> str:
+        """Strip character XML tags from text for UI display and TTS."""
+
+        # Remove opening tag <CharacterName>
+        text = re.sub(rf'<{re.escape(character_name)}>', '', text, flags=re.IGNORECASE)
+        # Remove closing tag </CharacterName>
+        text = re.sub(rf'</{re.escape(character_name)}>', '', text, flags=re.IGNORECASE)
+
+        return text
+
     def character_instruction_message(self, character: Character) -> Dict[str, str]:
         """Create character instruction message for group chat with character tags."""
 
@@ -430,12 +440,13 @@ class ChatLLM:
                                                                  on_text_chunk=on_text_chunk)
             
             if on_text_stream_stop:
-                await on_text_stream_stop(character, message_id, full_response)
+                # Send clean text (without tags) to UI
+                clean_response = self.strip_character_tags(full_response, character.name)
+                await on_text_stream_stop(character, message_id, clean_response)
 
             if full_response:
-                response_wrapped = self.wrap_character_tags(full_response, character.name)
-
-                self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_wrapped})
+                # Store raw response with tags in conversation history
+                self.conversation_history.append({"role": "assistant", "name": character.name, "content": full_response})
 
     async def stream_character_response(self, messages: List[Dict[str, str]], character: Character, message_id: str,
                                         model_settings: ModelSettings, sentence_queue: asyncio.Queue,
@@ -464,15 +475,25 @@ class ChatLLM:
                 }
             )
 
+            # Track clean text sent to UI (for computing deltas when stripping tags)
+            clean_sent_length = 0
+
             async def chunk_generator() -> AsyncGenerator[str, None]:
-                nonlocal full_response
+                nonlocal full_response, clean_sent_length
                 async for chunk in stream:
                     if chunk.choices and chunk.choices[0].delta:
                         content = chunk.choices[0].delta.content
                         if content:
                             full_response += content
+
+                            # Send clean (tag-stripped) delta to UI
                             if on_text_chunk:
-                                await on_text_chunk(content, character, message_id)
+                                clean_response = self.strip_character_tags(full_response, character.name)
+                                clean_delta = clean_response[clean_sent_length:]
+                                if clean_delta:
+                                    await on_text_chunk(clean_delta, character, message_id)
+                                clean_sent_length = len(clean_response)
+
                             yield content
 
             async for sentence in generate_sentences_async(
@@ -485,17 +506,20 @@ class ChatLLM:
             ):
                 sentence_text = sentence.strip()
                 if sentence_text:
-                    await sentence_queue.put(TTSSentence(
-                        text=sentence_text,
-                        index=sentence_index,
-                        message_id=message_id,
-                        character_id=character.id,
-                        character_name=character.name,
-                        voice_id=character.voice,
-                        is_final=False,
-                    ))
-                    logger.info(f"[LLM] {character.name} sentence {sentence_index}: {sentence_text[:50]}...")
-                    sentence_index += 1
+                    # Strip character tags for TTS
+                    clean_sentence = self.strip_character_tags(sentence_text, character.name)
+                    if clean_sentence:
+                        await sentence_queue.put(TTSSentence(
+                            text=clean_sentence,
+                            index=sentence_index,
+                            message_id=message_id,
+                            character_id=character.id,
+                            character_name=character.name,
+                            voice_id=character.voice,
+                            is_final=False,
+                        ))
+                        logger.info(f"[LLM] {character.name} sentence {sentence_index}: {clean_sentence[:50]}...")
+                        sentence_index += 1
 
         except Exception as e:
             logger.error(f"[LLM] Error streaming for {character.name}: {e}")

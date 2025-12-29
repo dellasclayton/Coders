@@ -302,7 +302,7 @@ class ChatLLM:
 
         return {
             'role': 'system',
-            'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else.'
+            'content': f'Based on the conversation history above provide the next reply as {character.name}. Your response should include only {character.name}\'s reply. Do not respond for/as anyone else. Wrap your entire response in <{character.name}></{character.name}> tags.'
         }
 
     def parse_character_mentions(self, message: str, active_characters: List[Character]) -> List[Character]:
@@ -1144,3 +1144,4 @@ app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

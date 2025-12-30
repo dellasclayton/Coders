@@ -39,6 +39,12 @@ from backend.stream2sentence import generate_sentences_async
 from backend.boson_multimodal.serve.serve_engine import HiggsAudioServeEngine
 from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioContent, TextContent
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
+from backend.higgs_audio_profile import (
+    VoiceProfileSession,
+    create_session,
+    generate_audio_stream_with_profile,
+    reset_session,
+)
 
 from backend.database_director import (db, Character, CharacterCreate, CharacterUpdate, Voice, VoiceCreate, VoiceUpdate, Conversation, ConversationCreate, ConversationUpdate, Message as ConversationMessage, MessageCreate)
 
@@ -532,7 +538,11 @@ def revert_delay_pattern(data: torch.Tensor, start_idx: int = 0) -> torch.Tensor
     return torch.cat(out, dim=0)
 
 class Speech:
-    """Worker Synthesizes Sentences using Higgs Audio"""
+    """Worker Synthesizes Sentences using Higgs Audio (Text Profile Method)"""
+
+    # Default voice profile settings - edit these to change the voice
+    DEFAULT_SPEAKER_DESC = "Male, American accent, modern speaking rate, moderate-pitch, friendly tone, and very clear audio."
+    DEFAULT_SCENE_PROMPT = "Audio is recorded from a quiet room."
 
     def __init__(self, queues: PipeQueues):
         self.queues = queues
@@ -544,7 +554,13 @@ class Speech:
         self._chunk_size = 14
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.voice_dir = "backend/voices"
+        # Voice profile sessions for consistent voice across generations
+        # Key: voice_id, Value: VoiceProfileSession
+        self.profile_sessions: Dict[str, VoiceProfileSession] = {}
+
+        # Configurable voice settings (can be updated at runtime)
+        self.speaker_desc = self.DEFAULT_SPEAKER_DESC
+        self.scene_prompt = self.DEFAULT_SCENE_PROMPT
 
     async def initialize(self):
 
@@ -622,125 +638,68 @@ class Speech:
                 logger.error(f"[TTS] Error generating audio: {e}")
                 continue
 
-    def load_voice_reference(self, voice: str):
-        """Load reference audio and text for voice cloning"""
+    def get_or_create_session(self, voice_id: str) -> VoiceProfileSession:
+        """
+        Get existing session or create new one for voice consistency.
 
-        audio_path = os.path.join(self.voice_dir, f"{voice}.wav")
-        text_path = os.path.join(self.voice_dir, f"{voice}.txt")
+        Each voice_id gets its own session to maintain consistent voice
+        across multiple generations within the same session.
+        """
+        if voice_id not in self.profile_sessions:
+            self.profile_sessions[voice_id] = create_session(
+                speaker_desc=self.speaker_desc,
+                scene_prompt=self.scene_prompt,
+                buffer_size=2,  # Keep last 2 generations for context
+            )
+            logger.info(f"[TTS] Created new voice profile session for: {voice_id}")
+        return self.profile_sessions[voice_id]
 
-        with open(text_path, 'r', encoding='utf-8') as f:
-            ref_text = f.read().strip()
+    def clear_session(self, voice_id: str) -> None:
+        """Clear the session for a specific voice (resets context)."""
+        if voice_id in self.profile_sessions:
+            reset_session(self.profile_sessions[voice_id])
+            logger.info(f"[TTS] Cleared voice profile session for: {voice_id}")
 
-        messages = [
-            Message(role="user", content=ref_text),
-            Message(role="assistant", content=AudioContent(audio_url=audio_path))
-        ]
-
-        return messages
+    def clear_all_sessions(self) -> None:
+        """Clear all voice profile sessions."""
+        for voice_id in self.profile_sessions:
+            reset_session(self.profile_sessions[voice_id])
+        logger.info(f"[TTS] Cleared all {len(self.profile_sessions)} voice profile sessions")
 
     async def generate_audio_for_sentence(self, text: str, voice: str) -> AsyncGenerator[bytes, None]:
-        """Generate audio for text using Higgs streaming"""
+        """
+        Generate audio for text using text profile method.
 
-        messages = self.load_voice_reference(voice)
-        messages.append(Message(role="user", content=text))
+        Uses speaker_desc and scene_prompt for voice characteristics,
+        and maintains context via VoiceProfileSession for voice consistency.
+        """
+        # Get or create session for this voice
+        session = self.get_or_create_session(voice)
 
-        chat_sample = ChatMLSample(messages=messages)
-
-        # Initialize streaming state
-        audio_tokens: list[torch.Tensor] = []
-        seq_len = 0
-
-        with torch.inference_mode():
-            async for delta in self.engine.generate_delta_stream(
-                chat_ml_sample=chat_sample,
-                max_new_tokens=2048,
-                temperature=0.7,
-                top_p=0.95,
-                top_k=50,
-                stop_strings=['<|end_of_text|>', '<|eot_id|>'],
-                ras_win_len=7,
-                ras_win_max_num_repeat=2,
-                force_audio_gen=True,
-            ):
-                if delta.audio_tokens is None:
-                    continue
-
-                # Check for end token (1025)
-                if torch.all(delta.audio_tokens == 1025):
-                    break
-
-                # Accumulate tokens
-                audio_tokens.append(delta.audio_tokens[:, None])
-
-                # Count non-padding tokens (1024 is padding)
-                if torch.all(delta.audio_tokens != 1024):
-                    seq_len += 1
-
-                # Decode when chunk size reached
-                if seq_len > 0 and seq_len % self._chunk_size == 0:
-                    audio_tensor = torch.cat(audio_tokens, dim=-1)
-
-                    try:
-                        # Revert delay pattern and decode
-                        vq_code = (revert_delay_pattern(audio_tensor, start_idx=seq_len - self._chunk_size + 1).clip(0, 1023).to(self._device))
-                        waveform = self.engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
-
-                        # Convert to numpy
-                        if isinstance(waveform, torch.Tensor):
-                            waveform_np = waveform.detach().cpu().numpy()
-                        else:
-                            waveform_np = np.asarray(waveform, dtype=np.float32)
-
-                        # Convert to PCM16 bytes
-                        pcm = np.clip(waveform_np, -1.0, 1.0)
-                        pcm16 = (pcm * 32767.0).astype(np.int16)
-                        yield pcm16.tobytes()
-
-                    except Exception as e:
-                        logger.warning(f"Error decoding chunk: {e}")
-                        continue
-
-        # Flush remaining tokens
-        if seq_len > 0 and seq_len % self._chunk_size != 0 and audio_tokens:
-            audio_tensor = torch.cat(audio_tokens, dim=-1)
-            remaining = seq_len % self._chunk_size
-
-            try:
-                vq_code = (revert_delay_pattern(audio_tensor, start_idx=seq_len - remaining + 1).clip(0, 1023).to(self._device))
-                waveform = self.engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
-
-                if isinstance(waveform, torch.Tensor):
-                    waveform_np = waveform.detach().cpu().numpy()
-                else:
-                    waveform_np = np.asarray(waveform, dtype=np.float32)
-
-                pcm = np.clip(waveform_np, -1.0, 1.0)
-                pcm16 = (pcm * 32767.0).astype(np.int16)
-                yield pcm16.tobytes()
-
-            except Exception as e:
-                logger.warning(f"Error flushing remaining audio: {e}")
+        # Stream audio using the profile method
+        async for pcm_bytes in generate_audio_stream_with_profile(
+            engine=self.engine,
+            text=text,
+            session=session,
+            chunk_size=self._chunk_size,
+        ):
+            yield pcm_bytes
 
     def get_available_voices(self):
-        """Get list of available voices in format expected by frontend"""
-        if not os.path.exists(self.voice_dir):
-            return []
+        """
+        Get list of available voices.
 
-        voices = []
-        for file in os.listdir(self.voice_dir):
-            if file.endswith('.wav'):
-                voice = file[:-4]  # Remove .wav extension
-                # Only include if matching .txt file exists
-                if os.path.exists(os.path.join(self.voice_dir, f"{voice}.txt")):
-                    # Format: {id: "voice_name", name: "Voice Name"}
-                    display_name = voice.replace('_', ' ').title()
-                    voices.append({
-                        "id": voice,
-                        "name": display_name
-                    })
-
-        voices.sort(key=lambda v: v['name'])
-        return voices
+        With text profile method, voices are defined by speaker_desc rather
+        than reference files. Returns active session IDs or a default profile.
+        """
+        # Return list of active profile sessions, or a default if none exist
+        if self.profile_sessions:
+            return [
+                {"id": voice_id, "name": voice_id.replace('_', ' ').title()}
+                for voice_id in self.profile_sessions.keys()
+            ]
+        # Return a default profile voice option
+        return [{"id": "default", "name": "Default Profile Voice"}]
 
 ########################################
 ##--        WebSocket Manager       --##

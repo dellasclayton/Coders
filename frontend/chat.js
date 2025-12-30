@@ -148,14 +148,19 @@ function handleResponseChunk(data) {
  * @param {boolean} isStabilized - Whether text is stabilized
  */
 function updateSTTPreview(text, isStabilized) {
-  let preview = document.getElementById('stt-preview')
+  let previewContainer = document.getElementById('stt-preview-container')
 
-  if (!preview) {
-    preview = createSTTPreviewElement()
+  if (!previewContainer) {
+    previewContainer = createSTTPreviewElement()
   }
 
-  preview.textContent = text
-  preview.classList.toggle('stabilized', isStabilized)
+  const content = previewContainer.querySelector('.message-content')
+  if (content) {
+    content.textContent = text
+  }
+
+  previewContainer.classList.toggle('stabilized', isStabilized)
+  scrollToBottom()
 }
 
 /**
@@ -166,20 +171,27 @@ function createSTTPreviewElement() {
   const messagesArea = getMessagesArea()
   if (!messagesArea) return null
 
-  const preview = document.createElement('div')
-  preview.id = 'stt-preview'
-  preview.className = 'stt-preview'
-  messagesArea.appendChild(preview)
+  const previewContainer = document.createElement('div')
+  previewContainer.id = 'stt-preview-container'
+  previewContainer.className = 'chat-message user stt-preview-message'
 
+  previewContainer.innerHTML = `
+    <div class="message-bubble">
+      <div class="message-content"></div>
+      <div class="message-time">Listening...</div>
+    </div>
+  `
+
+  messagesArea.appendChild(previewContainer)
   scrollToBottom()
-  return preview
+  return previewContainer
 }
 
 /**
  * Remove STT preview element
  */
 function removeSTTPreview() {
-  const preview = document.getElementById('stt-preview')
+  const preview = document.getElementById('stt-preview-container')
   if (preview) {
     preview.remove()
   }
@@ -314,7 +326,7 @@ export function sendMessage(text) {
 }
 
 /**
- * Clear chat messages and start a new conversation
+ * Clear chat messages
  */
 export function clearChat() {
   const messagesArea = getMessagesArea()
@@ -326,8 +338,8 @@ export function clearChat() {
   state.isStreaming = false
   state.currentStreamElement = null
 
-  // Clear server-side history and create new conversation
-  websocket.newConversation()
+  // Also clear server-side history
+  websocket.clearHistory()
 }
 
 /**

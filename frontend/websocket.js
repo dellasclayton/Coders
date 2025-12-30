@@ -383,13 +383,6 @@ export function clearHistory() {
 }
 
 /**
- * Start a new conversation (clears history and creates new conversation in database)
- */
-export function newConversation() {
-  sendText({ type: 'new_conversation' })
-}
-
-/**
  * Refresh active characters from database
  */
 export function refreshActiveCharacters() {

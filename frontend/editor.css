@@ -247,30 +247,6 @@
   background-color: #191b1f;
 }
 
-.new-conversation-button {
-  background-color: #3b82f6;
-  border: none;
-  color: white;
-  cursor: pointer;
-  padding: 10px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-  width: 40px;
-  height: 40px;
-}
-
-.new-conversation-button:hover {
-  background-color: #2563eb;
-  transform: scale(1.05);
-}
-
-.new-conversation-button:active {
-  transform: scale(0.95);
-}
-
 .mic-button {
   background-color: #2a2a2a;
   border: none;

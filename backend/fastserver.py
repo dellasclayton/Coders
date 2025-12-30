@@ -768,57 +768,6 @@ class WebSocketManager:
         self.user_name = "Jay"
         self._suppress_audio = False
 
-        # Conversation persistence state
-        self.current_conversation_id: Optional[str] = None
-        self._is_first_message: bool = True
-
-    def _save_in_background(self, coroutine):
-        """Fire-and-forget database save - never blocks chat flow"""
-        task = asyncio.create_task(coroutine)
-        task.add_done_callback(
-            lambda t: logger.error(f"Background save failed: {t.exception()}")
-            if t.exception() else None
-        )
-
-    async def _create_new_conversation(self):
-        """Create conversation in Supabase"""
-        try:
-            active_characters = [
-                {"id": character.id, "name": character.name}
-                for character in self.chat.active_characters
-            ]
-            conversation = await db.create_conversation(
-                ConversationCreate(active_characters=active_characters)
-            )
-            self.current_conversation_id = conversation.conversation_id
-            self._is_first_message = True
-            logger.info(f"Created conversation: {conversation.conversation_id}")
-        except Exception as error:
-            logger.error(f"Failed to create conversation: {error}")
-
-    def _save_message_in_background(self, role: str, content: str,
-                                     name: Optional[str] = None,
-                                     character_id: Optional[str] = None):
-        """Fire-and-forget message save"""
-        if not self.current_conversation_id:
-            return
-
-        async def save_message():
-            await db.create_message(MessageCreate(
-                conversation_id=self.current_conversation_id,
-                role=role,
-                content=content,
-                name=name,
-                character_id=character_id
-            ))
-
-            # Auto-update title on first user message
-            if self._is_first_message and role == "user":
-                self._is_first_message = False
-                await db.auto_update_conversation_title(self.current_conversation_id, content)
-
-        self._save_in_background(save_message())
-
     async def initialize(self): # <============================= boom
         """Initialize all pipeline components at startup"""
         
@@ -843,10 +792,7 @@ class WebSocketManager:
         await websocket.accept()
         self.websocket = websocket
 
-        # Create new conversation in background (non-blocking)
-        self._save_in_background(self._create_new_conversation())
-
-        await self.start_pipeline()
+        await self.start_pipeline() # <============================= boom
 
         logger.info("WebSocket connected, pipeline started")
 
@@ -904,14 +850,6 @@ class WebSocketManager:
             elif message_type == "clear_history":
                 if self.chat:
                     self.chat.clear_conversation_history()
-                # Also create a new conversation
-                self._save_in_background(self._create_new_conversation())
-                await self.send_text_to_client({"type": "history_cleared"})
-
-            elif message_type == "new_conversation":
-                if self.chat:
-                    self.chat.clear_conversation_history()
-                self._save_in_background(self._create_new_conversation())
                 await self.send_text_to_client({"type": "history_cleared"})
 
             elif message_type == "interrupt":
@@ -996,14 +934,6 @@ class WebSocketManager:
                 "text": full_text,
             },
         })
-
-        # Save assistant message in background (non-blocking)
-        self._save_message_in_background(
-            role="assistant",
-            content=full_text,
-            name=character.name,
-            character_id=character.id
-        )
 
     async def on_audio_stream_start(self, chunk: AudioChunk):
         sample_rate = self.speech.sample_rate if self.speech else 24000
@@ -1121,13 +1051,6 @@ class WebSocketManager:
                 user_message: str = await self.queues.transcribe_queue.get()
 
                 if user_message and user_message.strip():
-                    # Save user message in background (non-blocking)
-                    self._save_message_in_background(
-                        role="user",
-                        content=user_message,
-                        name=self.user_name
-                    )
-
                     await self.chat.process_message_prompt(
                         user_message=user_message,
                         sentence_queue=self.queues.sentence_queue,

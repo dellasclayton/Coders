@@ -771,7 +771,7 @@ class WebSocketManager:
     async def initialize(self): # <============================= boom
         """Initialize all pipeline components at startup"""
         
-        api_key = os.getenv("OPENROUTER_API_KEY", "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")
+        api_key = os.getenv("OPENROUTER_API_KEY", "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")
 
         self.transcribe = Transcribe(on_transcription_update=self.on_transcription_update,
                                      on_transcription_stabilized=self.on_transcription_stabilized,
@@ -1122,3 +1122,4 @@ app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

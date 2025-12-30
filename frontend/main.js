@@ -14,9 +14,18 @@ import * as websocket from './websocket.js';
 import * as chat from './chat.js';
 import * as ttsAudio from './tts-audio.js';
 
+/**
+ * Handle new conversation button click
+ */
+function handleNewConversation() {
+  chat.clearChat()
+  console.log('[Main] Started new conversation')
+}
+
 // Make functions globally accessible for inline event handlers
 window.handleMic = handleMic;
 window.handleSend = handleSend;
+window.handleNewConversation = handleNewConversation;
 
 // Wait for DOM to be fully loaded
 document.addEventListener('DOMContentLoaded', () => {
@@ -149,6 +158,12 @@ function loadPage(page, container) {
               </div>
 
               <div class="editor-footer">
+                <button class="new-conversation-button" onclick="handleNewConversation()" title="New Conversation">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
+                </button>
                 <button class="mic-button" onclick="handleMic()">
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>

@@ -314,7 +314,7 @@ export function sendMessage(text) {
 }
 
 /**
- * Clear chat messages
+ * Clear chat messages and start a new conversation
  */
 export function clearChat() {
   const messagesArea = getMessagesArea()
@@ -326,8 +326,8 @@ export function clearChat() {
   state.isStreaming = false
   state.currentStreamElement = null
 
-  // Also clear server-side history
-  websocket.clearHistory()
+  // Clear server-side history and create new conversation
+  websocket.newConversation()
 }
 
 /**

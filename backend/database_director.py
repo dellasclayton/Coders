@@ -135,6 +135,7 @@ class VoiceCreate(BaseModel):
 
 
 class VoiceUpdate(BaseModel):
+    new_voice: Optional[str] = None
     method: Optional[str] = None
     audio_path: Optional[str] = None
     text_path: Optional[str] = None
@@ -617,6 +618,13 @@ class DatabaseDirector:
     async def create_voice(self, voice_data: VoiceCreate) -> Voice:
         """Create a new voice."""
         try:
+            voice_name = (voice_data.voice or "").strip()
+            if not voice_name:
+                raise HTTPException(status_code=400, detail="Voice name required")
+
+            if self._cache_loaded and voice_name in self._voice_cache:
+                raise HTTPException(status_code=400, detail="Voice name already exists")
+
             now = datetime.now().isoformat()
             voice_id = str(uuid.uuid4())
 
@@ -624,14 +632,14 @@ class DatabaseDirector:
                 await conn.execute(
                     """INSERT INTO voices (voice, method, audio_path, text_path, speaker_desc, scene_prompt, id, created_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (voice_data.voice, voice_data.method, voice_data.audio_path,
+                    (voice_name, voice_data.method, voice_data.audio_path,
                      voice_data.text_path, voice_data.speaker_desc, voice_data.scene_prompt,
                      voice_id, now, now)
                 )
                 await conn.commit()
 
             voice = Voice(
-                voice=voice_data.voice,
+                voice=voice_name,
                 method=voice_data.method,
                 audio_path=voice_data.audio_path,
                 text_path=voice_data.text_path,
@@ -643,7 +651,7 @@ class DatabaseDirector:
                 updated_at=now
             )
 
-            self._voice_cache[voice_data.voice] = {
+            self._voice_cache[voice_name] = {
                 "config": voice,
                 "audio_tokens": None
             }
@@ -660,8 +668,16 @@ class DatabaseDirector:
         try:
             await self.get_voice(voice_name)
 
+            new_voice = (voice_data.new_voice or "").strip() if voice_data.new_voice is not None else None
             updates = []
             params = []
+
+            if new_voice:
+                if new_voice != voice_name:
+                    updates.append("voice = ?")
+                    params.append(new_voice)
+            elif voice_data.new_voice is not None:
+                raise HTTPException(status_code=400, detail="New voice name required")
 
             if voice_data.method is not None:
                 updates.append("method = ?")
@@ -685,25 +701,62 @@ class DatabaseDirector:
             if not updates:
                 raise HTTPException(status_code=400, detail="No fields to update")
 
+            now = datetime.now().isoformat()
             updates.append("updated_at = ?")
-            params.append(datetime.now().isoformat())
+            params.append(now)
             params.append(voice_name)
 
             async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+
+                if new_voice and new_voice != voice_name:
+                    cursor = await conn.execute(
+                        "SELECT voice FROM voices WHERE voice = ?",
+                        (new_voice,)
+                    )
+                    if await cursor.fetchone():
+                        raise HTTPException(status_code=400, detail="Voice name already exists")
+
                 await conn.execute(
                     f"UPDATE voices SET {', '.join(updates)} WHERE voice = ?",
                     params
                 )
+
+                if new_voice and new_voice != voice_name:
+                    await conn.execute(
+                        "UPDATE characters SET voice = ?, updated_at = ? WHERE voice = ?",
+                        (new_voice, now, voice_name)
+                    )
+
                 await conn.commit()
 
-            voice = await self.get_voice(voice_name)
+                updated_voice_name = new_voice if new_voice and new_voice != voice_name else voice_name
+                cursor = await conn.execute(
+                    "SELECT * FROM voices WHERE voice = ?",
+                    (updated_voice_name,)
+                )
+                row = await cursor.fetchone()
 
-            self._voice_cache[voice_name] = {
+            if not row:
+                raise HTTPException(status_code=404, detail="Voice not found")
+
+            voice = self._row_to_voice(row)
+
+            if new_voice and new_voice != voice_name and voice_name in self._voice_cache:
+                del self._voice_cache[voice_name]
+
+            self._voice_cache[voice.voice] = {
                 "config": voice,
                 "audio_tokens": voice.audio_tokens
             }
 
-            logger.info(f"Updated voice: {voice_name}")
+            if new_voice and new_voice != voice_name and self._cache_loaded:
+                for character in self._character_cache.values():
+                    if character.voice == voice_name:
+                        character.voice = new_voice
+                        character.updated_at = now
+
+            logger.info(f"Updated voice: {voice.voice}")
             return voice
 
         except HTTPException:
@@ -718,11 +771,22 @@ class DatabaseDirector:
             await self.get_voice(voice_name)
 
             async with aiosqlite.connect(DB_PATH) as conn:
+                now = datetime.now().isoformat()
                 await conn.execute("DELETE FROM voices WHERE voice = ?", (voice_name,))
+                await conn.execute(
+                    "UPDATE characters SET voice = '', updated_at = ? WHERE voice = ?",
+                    (now, voice_name)
+                )
                 await conn.commit()
 
             if voice_name in self._voice_cache:
                 del self._voice_cache[voice_name]
+
+            if self._cache_loaded:
+                for character in self._character_cache.values():
+                    if character.voice == voice_name:
+                        character.voice = ""
+                        character.updated_at = now
 
             logger.info(f"Deleted voice: {voice_name}")
             return True

@@ -267,9 +267,31 @@ class CharacterCache {
       throw new Error(`Voice not found: ${voiceName}`)
     }
 
+    const newVoiceName = typeof updates?.new_voice === 'string' ? updates.new_voice.trim() : null
+    const isRename = newVoiceName && newVoiceName !== voiceName
+
+    const updateCharactersForVoice = (fromVoice, toVoice) => {
+      if (!fromVoice || !toVoice || fromVoice === toVoice) return
+      this.characters.forEach((character, id) => {
+        if (character.voice === fromVoice) {
+          const updated = { ...character, voice: toVoice }
+          this.characters.set(id, updated)
+          this.emit('character:updated', updated)
+        }
+      })
+    }
+
     // Optimistic update
     const optimistic = { ...original, ...updates }
-    this.voices.set(voiceName, optimistic)
+    if (isRename) {
+      optimistic.voice = newVoiceName
+      this.voices.delete(voiceName)
+      this.voices.set(newVoiceName, optimistic)
+      updateCharactersForVoice(voiceName, newVoiceName)
+    } else {
+      this.voices.set(voiceName, optimistic)
+    }
+
     this.emit('voice:updated', optimistic)
 
     try {
@@ -277,7 +299,12 @@ class CharacterCache {
       const data = await db.updateVoice(voiceName, updates)
 
       // Update cache with server response
+      if (data.voice !== voiceName) {
+        this.voices.delete(voiceName)
+      }
+      this.voices.delete(newVoiceName)
       this.voices.set(data.voice, data)
+      updateCharactersForVoice(voiceName, data.voice)
 
       console.log('Voice updated:', data.voice)
       this.emit('voice:updated:confirmed', data)
@@ -286,6 +313,10 @@ class CharacterCache {
 
     } catch (error) {
       // Rollback
+      if (isRename) {
+        this.voices.delete(newVoiceName)
+        updateCharactersForVoice(newVoiceName, voiceName)
+      }
       this.voices.set(voiceName, original)
       this.emit('voice:updated', original)
 
@@ -306,9 +337,23 @@ class CharacterCache {
       throw new Error(`Voice not found: ${voiceName}`)
     }
 
+    const affectedCharacters = []
+
+    const clearCharactersForVoice = () => {
+      this.characters.forEach((character, id) => {
+        if (character.voice === voiceName) {
+          affectedCharacters.push({ id, character })
+          const updated = { ...character, voice: '' }
+          this.characters.set(id, updated)
+          this.emit('character:updated', updated)
+        }
+      })
+    }
+
     // Optimistic delete
     this.voices.delete(voiceName)
     this.emit('voice:deleted', { voice: voiceName, data: original })
+    clearCharactersForVoice()
 
     try {
       await db.deleteVoice(voiceName)
@@ -319,6 +364,10 @@ class CharacterCache {
     } catch (error) {
       // Rollback
       this.voices.set(voiceName, original)
+      affectedCharacters.forEach(({ id, character }) => {
+        this.characters.set(id, character)
+        this.emit('character:updated', character)
+      })
       this.emit('voice:created', original)
 
       throw error

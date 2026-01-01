@@ -514,11 +514,26 @@ function loadPage(page, container) {
       <div class="speech-page">
         <!-- Left Column: Content -->
         <div class="speech-content-column">
-             <div class="speech-list-placeholder">
-                <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>
-                <h3>Voice List</h3>
-                <p>Coming soon: Manage your cached and generated voices here.</p>
-             </div>
+          <div class="voice-list-card">
+            <div class="voice-list-header">
+              <div>
+                <h3>Voices</h3>
+                <p class="voice-list-subtitle">Saved voices in SQLite</p>
+              </div>
+              <button class="voice-list-action-btn" id="speech-new-voice-btn">New Voice</button>
+            </div>
+            <div class="voice-list" id="speech-voice-list"></div>
+            <div class="voice-list-empty" id="speech-voice-empty">
+              <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="22"/>
+                <line x1="8" y1="22" x2="16" y2="22"/>
+              </svg>
+              <h4>No voices yet</h4>
+              <p>Create your first voice to see it here.</p>
+            </div>
+          </div>
         </div>
 
         <!-- Right Column: Voice Creator -->
@@ -581,10 +596,13 @@ function loadPage(page, container) {
                     <textarea class="speech-form-textarea" id="speech-scene-prompt" placeholder="Optional context for the voice generation..."></textarea>
                 </div>
 
-                <button class="create-voice-btn" id="speech-create-btn">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-                    Create Voice
-                </button>
+                <div class="voice-form-actions">
+                  <button class="create-voice-btn" id="speech-create-btn">
+                      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+                      Create Voice
+                  </button>
+                  <button class="delete-voice-btn" id="speech-delete-btn" disabled>Delete Voice</button>
+                </div>
             </div>
           </div>
         </div>

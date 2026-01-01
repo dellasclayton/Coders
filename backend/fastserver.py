@@ -877,6 +877,271 @@ class WebSocketManager:
             elif message_type == "interrupt":
                 await self.handle_interrupt()
 
+            # ==========================================
+            # Database Operations - Characters
+            # ==========================================
+            elif message_type == "get_characters":
+                characters = await db.get_all_characters()
+                await self.send_text_to_client({
+                    "type": "characters_data",
+                    "data": [c.model_dump() for c in characters]
+                })
+
+            elif message_type == "get_character":
+                character_id = payload.get("id")
+                try:
+                    character = await db.get_character(character_id)
+                    await self.send_text_to_client({
+                        "type": "character_data",
+                        "data": character.model_dump()
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "create_character":
+                try:
+                    character = await db.create_character(CharacterCreate(**payload))
+                    await self.send_text_to_client({
+                        "type": "character_created",
+                        "data": character.model_dump()
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "update_character":
+                character_id = payload.pop("id", None)
+                if not character_id:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": "Character ID required"
+                    })
+                else:
+                    try:
+                        character = await db.update_character(character_id, CharacterUpdate(**payload))
+                        await self.send_text_to_client({
+                            "type": "character_updated",
+                            "data": character.model_dump()
+                        })
+                        # Refresh active characters if is_active changed
+                        if "is_active" in payload:
+                            await self.refresh_active_characters()
+                    except HTTPException as e:
+                        await self.send_text_to_client({
+                            "type": "db_error",
+                            "error": e.detail
+                        })
+
+            elif message_type == "delete_character":
+                character_id = payload.get("id")
+                try:
+                    await db.delete_character(character_id)
+                    await self.send_text_to_client({
+                        "type": "character_deleted",
+                        "data": {"id": character_id}
+                    })
+                    await self.refresh_active_characters()
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            # ==========================================
+            # Database Operations - Voices
+            # ==========================================
+            elif message_type == "get_voices":
+                voices = await db.get_all_voices()
+                await self.send_text_to_client({
+                    "type": "voices_data",
+                    "data": [v.model_dump() for v in voices]
+                })
+
+            elif message_type == "get_voice":
+                voice_name = payload.get("voice")
+                try:
+                    voice = await db.get_voice(voice_name)
+                    await self.send_text_to_client({
+                        "type": "voice_data",
+                        "data": voice.model_dump()
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "create_voice":
+                try:
+                    voice = await db.create_voice(VoiceCreate(**payload))
+                    await self.send_text_to_client({
+                        "type": "voice_created",
+                        "data": voice.model_dump()
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "update_voice":
+                voice_name = payload.pop("voice", None)
+                if not voice_name:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": "Voice name required"
+                    })
+                else:
+                    try:
+                        voice = await db.update_voice(voice_name, VoiceUpdate(**payload))
+                        await self.send_text_to_client({
+                            "type": "voice_updated",
+                            "data": voice.model_dump()
+                        })
+                    except HTTPException as e:
+                        await self.send_text_to_client({
+                            "type": "db_error",
+                            "error": e.detail
+                        })
+
+            elif message_type == "delete_voice":
+                voice_name = payload.get("voice")
+                try:
+                    await db.delete_voice(voice_name)
+                    await self.send_text_to_client({
+                        "type": "voice_deleted",
+                        "data": {"voice": voice_name}
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            # ==========================================
+            # Database Operations - Conversations
+            # ==========================================
+            elif message_type == "get_conversations":
+                limit = payload.get("limit")
+                offset = payload.get("offset", 0)
+                conversations = await db.get_all_conversations(limit=limit, offset=offset)
+                await self.send_text_to_client({
+                    "type": "conversations_data",
+                    "data": [c.model_dump() for c in conversations]
+                })
+
+            elif message_type == "get_conversation":
+                conversation_id = payload.get("conversation_id")
+                try:
+                    conversation = await db.get_conversation(conversation_id)
+                    await self.send_text_to_client({
+                        "type": "conversation_data",
+                        "data": conversation.model_dump()
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "create_conversation":
+                try:
+                    conversation = await db.create_conversation(ConversationCreate(**payload))
+                    await self.send_text_to_client({
+                        "type": "conversation_created",
+                        "data": conversation.model_dump()
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "update_conversation":
+                conversation_id = payload.pop("conversation_id", None)
+                if not conversation_id:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": "Conversation ID required"
+                    })
+                else:
+                    try:
+                        conversation = await db.update_conversation(conversation_id, ConversationUpdate(**payload))
+                        await self.send_text_to_client({
+                            "type": "conversation_updated",
+                            "data": conversation.model_dump()
+                        })
+                    except HTTPException as e:
+                        await self.send_text_to_client({
+                            "type": "db_error",
+                            "error": e.detail
+                        })
+
+            elif message_type == "delete_conversation":
+                conversation_id = payload.get("conversation_id")
+                try:
+                    await db.delete_conversation(conversation_id)
+                    await self.send_text_to_client({
+                        "type": "conversation_deleted",
+                        "data": {"conversation_id": conversation_id}
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            # ==========================================
+            # Database Operations - Messages
+            # ==========================================
+            elif message_type == "get_messages":
+                conversation_id = payload.get("conversation_id")
+                limit = payload.get("limit")
+                offset = payload.get("offset", 0)
+                try:
+                    messages = await db.get_messages(conversation_id, limit=limit, offset=offset)
+                    await self.send_text_to_client({
+                        "type": "messages_data",
+                        "data": [m.model_dump() for m in messages]
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "create_message":
+                try:
+                    message = await db.create_message(MessageCreate(**payload))
+                    await self.send_text_to_client({
+                        "type": "message_created",
+                        "data": message.model_dump()
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
+            elif message_type == "delete_message":
+                message_id = payload.get("message_id")
+                try:
+                    await db.delete_message(message_id)
+                    await self.send_text_to_client({
+                        "type": "message_deleted",
+                        "data": {"message_id": message_id}
+                    })
+                except HTTPException as e:
+                    await self.send_text_to_client({
+                        "type": "db_error",
+                        "error": e.detail
+                    })
+
         except Exception as e:
             logger.error(f"Error handling message: {e}", exc_info=True)
 

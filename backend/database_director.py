@@ -1,18 +1,19 @@
 """
 Database Director Module
-Centralized database operations for Characters, Voices, Conversations, and Messages
-using Supabase as the backend.
+SQLite-based database operations for Characters, Voices, Conversations, and Messages.
+Optimized for low-latency single-user voice chat application.
 """
 
 import os
 import re
 import json
 import logging
-import threading
+import asyncio
+import uuid
+import aiosqlite
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel
-from supabase import create_client, Client
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
@@ -21,14 +22,64 @@ logger = logging.getLogger(__name__)
 ##--         Configuration          --##
 ########################################
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
+DB_PATH = os.path.join(os.path.dirname(__file__), "voicechat.db")
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS characters (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    voice TEXT DEFAULT '',
+    system_prompt TEXT DEFAULT '',
+    image_url TEXT DEFAULT '',
+    images TEXT DEFAULT '[]',
+    is_active INTEGER DEFAULT 0,
+    last_message TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS voices (
+    voice TEXT PRIMARY KEY,
+    method TEXT DEFAULT '',
+    audio_path TEXT DEFAULT '',
+    text_path TEXT DEFAULT '',
+    speaker_desc TEXT DEFAULT '',
+    scene_prompt TEXT DEFAULT '',
+    audio_tokens TEXT DEFAULT NULL,
+    id TEXT DEFAULT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id TEXT PRIMARY KEY,
+    title TEXT,
+    active_characters TEXT DEFAULT '[]',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    name TEXT,
+    content TEXT NOT NULL,
+    character_id TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_characters_is_active ON characters(is_active);
+"""
 
 ########################################
 ##--          Data Models           --##
 ########################################
 
-# Character Models
 class Character(BaseModel):
     id: str
     name: str
@@ -61,9 +112,8 @@ class CharacterUpdate(BaseModel):
     last_message: Optional[str] = None
 
 
-# Voice Models
 class Voice(BaseModel):
-    voice: str  # Primary key
+    voice: str
     method: str = ""
     audio_path: str = ""
     text_path: str = ""
@@ -93,7 +143,6 @@ class VoiceUpdate(BaseModel):
     audio_tokens: Optional[Any] = None
 
 
-# Conversation Models
 class Conversation(BaseModel):
     conversation_id: str
     title: Optional[str] = None
@@ -112,11 +161,10 @@ class ConversationUpdate(BaseModel):
     active_characters: Optional[List[Dict[str, Any]]] = None
 
 
-# Message Models
 class Message(BaseModel):
     message_id: str
     conversation_id: str
-    role: str  # "user", "assistant", "system"
+    role: str
     name: Optional[str] = None
     content: str
     character_id: Optional[str] = None
@@ -138,26 +186,115 @@ class MessageCreate(BaseModel):
 
 class DatabaseDirector:
     """
-    Centralized database management for all Supabase operations.
-    Handles Characters, Voices, Conversations, and Messages.
+    SQLite-based database management for voice chat application.
+    Uses in-memory caching for characters and voices at startup.
+    Background writes for messages to avoid latency.
     """
 
-    def __init__(self, supabase_client: Optional[Client] = None):
-        """Initialize with optional Supabase client, or create one from env vars."""
-        if supabase_client:
-            self.supabase = supabase_client
-        else:
-            self.supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-        # Voice cache for performance
+    def __init__(self):
+        self._character_cache: Dict[str, Character] = {}
         self._voice_cache: Dict[str, Dict[str, Any]] = {}
-        self._cache_lock = threading.Lock()
+        self._cache_loaded = False
+
+    async def init_database(self):
+        """Initialize database schema and load caches."""
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.executescript(SCHEMA_SQL)
+            await conn.commit()
+        logger.info(f"SQLite database initialized at {DB_PATH}")
+
+        await self._load_caches()
+
+    async def _load_caches(self):
+        """Load characters and voices into memory at startup."""
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            # Load all characters
+            cursor = await conn.execute("SELECT * FROM characters")
+            rows = await cursor.fetchall()
+            for row in rows:
+                character = self._row_to_character(row)
+                self._character_cache[character.id] = character
+
+            # Load all voices
+            cursor = await conn.execute("SELECT * FROM voices")
+            rows = await cursor.fetchall()
+            for row in rows:
+                voice = self._row_to_voice(row)
+                self._voice_cache[voice.voice] = {
+                    "config": voice,
+                    "audio_tokens": voice.audio_tokens
+                }
+
+        self._cache_loaded = True
+        logger.info(f"Loaded {len(self._character_cache)} characters and {len(self._voice_cache)} voices into cache")
+
+    def _row_to_character(self, row: aiosqlite.Row) -> Character:
+        """Convert database row to Character model."""
+        return Character(
+            id=row["id"],
+            name=row["name"],
+            voice=row["voice"] or "",
+            system_prompt=row["system_prompt"] or "",
+            image_url=row["image_url"] or "",
+            images=json.loads(row["images"]) if row["images"] else [],
+            is_active=bool(row["is_active"]),
+            last_message=row["last_message"] or "",
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )
+
+    def _row_to_voice(self, row: aiosqlite.Row) -> Voice:
+        """Convert database row to Voice model."""
+        audio_tokens = None
+        if row["audio_tokens"]:
+            try:
+                audio_tokens = json.loads(row["audio_tokens"])
+            except (json.JSONDecodeError, TypeError):
+                audio_tokens = row["audio_tokens"]
+
+        return Voice(
+            voice=row["voice"],
+            method=row["method"] or "",
+            audio_path=row["audio_path"] or "",
+            text_path=row["text_path"] or "",
+            speaker_desc=row["speaker_desc"] or "",
+            scene_prompt=row["scene_prompt"] or "",
+            audio_tokens=audio_tokens,
+            id=row["id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )
+
+    def _row_to_conversation(self, row: aiosqlite.Row) -> Conversation:
+        """Convert database row to Conversation model."""
+        return Conversation(
+            conversation_id=row["conversation_id"],
+            title=row["title"],
+            active_characters=json.loads(row["active_characters"]) if row["active_characters"] else [],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )
+
+    def _row_to_message(self, row: aiosqlite.Row) -> Message:
+        """Convert database row to Message model."""
+        return Message(
+            message_id=row["message_id"],
+            conversation_id=row["conversation_id"],
+            role=row["role"],
+            name=row["name"],
+            content=row["content"],
+            character_id=row["character_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"]
+        )
 
     ########################################
     ##--      Character Operations      --##
     ########################################
 
-    def _generate_character_id(self, name: str) -> str:
+    async def _generate_character_id(self, name: str) -> str:
         """Generate a sequential ID from the character name."""
         base_id = name.lower().strip()
         base_id = re.sub(r'[^a-z0-9\s-]', '', base_id)
@@ -165,17 +302,22 @@ class DatabaseDirector:
         base_id = re.sub(r'-+', '-', base_id)
         base_id = base_id.strip('-')
 
+        if not base_id:
+            base_id = "character"
+
         try:
-            response = self.supabase.table("characters")\
-                .select("id")\
-                .like("id", f"{base_id}-%")\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute(
+                    "SELECT id FROM characters WHERE id LIKE ?",
+                    (f"{base_id}-%",)
+                )
+                rows = await cursor.fetchall()
 
             highest_num = 0
             pattern = re.compile(rf"^{re.escape(base_id)}-(\d{{3}})$")
 
-            for row in response.data:
-                match = pattern.match(row["id"])
+            for row in rows:
+                match = pattern.match(row[0])
                 if match:
                     num = int(match.group(1))
                     highest_num = max(highest_num, num)
@@ -191,29 +333,21 @@ class DatabaseDirector:
             return f"{base_id}-001"
 
     async def get_all_characters(self) -> List[Character]:
-        """Get all characters."""
+        """Get all characters from cache."""
+        if self._cache_loaded:
+            characters = list(self._character_cache.values())
+            logger.info(f"Retrieved {len(characters)} characters from cache")
+            return characters
+
+        # Fallback to database if cache not loaded
         try:
-            response = self.supabase.table("characters")\
-                .select("*")\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute("SELECT * FROM characters")
+                rows = await cursor.fetchall()
 
-            characters = []
-            for row in response.data:
-                character_data = {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "voice": row.get("voice") or "",
-                    "system_prompt": row.get("system_prompt") or "",
-                    "image_url": row.get("image_url") or "",
-                    "images": row.get("images") or [],
-                    "is_active": row.get("is_active") or False,
-                    "last_message": row.get("last_message") or "",
-                    "created_at": row.get("created_at"),
-                    "updated_at": row.get("updated_at")
-                }
-                characters.append(Character(**character_data))
-
-            logger.info(f"Retrieved {len(characters)} characters")
+            characters = [self._row_to_character(row) for row in rows]
+            logger.info(f"Retrieved {len(characters)} characters from database")
             return characters
 
         except Exception as e:
@@ -221,30 +355,20 @@ class DatabaseDirector:
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     async def get_active_characters(self) -> List[Character]:
-        """Get all active characters."""
+        """Get all active characters from cache."""
+        if self._cache_loaded:
+            characters = [c for c in self._character_cache.values() if c.is_active]
+            logger.info(f"Retrieved {len(characters)} active characters from cache")
+            return characters
+
         try:
-            response = self.supabase.table("characters")\
-                .select("*")\
-                .eq("is_active", True)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute("SELECT * FROM characters WHERE is_active = 1")
+                rows = await cursor.fetchall()
 
-            characters = []
-            for row in response.data:
-                character_data = {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "voice": row.get("voice") or "",
-                    "system_prompt": row.get("system_prompt") or "",
-                    "image_url": row.get("image_url") or "",
-                    "images": row.get("images") or [],
-                    "is_active": row.get("is_active") or False,
-                    "last_message": row.get("last_message") or "",
-                    "created_at": row.get("created_at"),
-                    "updated_at": row.get("updated_at")
-                }
-                characters.append(Character(**character_data))
-
-            logger.info(f"Retrieved {len(characters)} active characters")
+            characters = [self._row_to_character(row) for row in rows]
+            logger.info(f"Retrieved {len(characters)} active characters from database")
             return characters
 
         except Exception as e:
@@ -253,30 +377,22 @@ class DatabaseDirector:
 
     async def get_character(self, character_id: str) -> Character:
         """Get a specific character by ID."""
-        try:
-            response = self.supabase.table("characters")\
-                .select("*")\
-                .eq("id", character_id)\
-                .execute()
+        if self._cache_loaded and character_id in self._character_cache:
+            return self._character_cache[character_id]
 
-            if not response.data:
+        try:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM characters WHERE id = ?",
+                    (character_id,)
+                )
+                row = await cursor.fetchone()
+
+            if not row:
                 raise HTTPException(status_code=404, detail="Character not found")
 
-            row = response.data[0]
-            character_data = {
-                "id": row["id"],
-                "name": row["name"],
-                "voice": row.get("voice") or "",
-                "system_prompt": row.get("system_prompt") or "",
-                "image_url": row.get("image_url") or "",
-                "images": row.get("images") or [],
-                "is_active": row.get("is_active") or False,
-                "last_message": row.get("last_message") or "",
-                "created_at": row.get("created_at"),
-                "updated_at": row.get("updated_at")
-            }
-
-            return Character(**character_data)
+            return self._row_to_character(row)
 
         except HTTPException:
             raise
@@ -287,29 +403,37 @@ class DatabaseDirector:
     async def create_character(self, character_data: CharacterCreate) -> Character:
         """Create a new character."""
         try:
-            character_id = self._generate_character_id(character_data.name)
+            character_id = await self._generate_character_id(character_data.name)
+            now = datetime.now().isoformat()
 
-            db_data = {
-                "id": character_id,
-                "name": character_data.name,
-                "voice": character_data.voice,
-                "system_prompt": character_data.system_prompt,
-                "image_url": character_data.image_url,
-                "images": character_data.images,
-                "is_active": character_data.is_active
-            }
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    """INSERT INTO characters (id, name, voice, system_prompt, image_url, images, is_active, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (character_id, character_data.name, character_data.voice,
+                     character_data.system_prompt, character_data.image_url,
+                     json.dumps(character_data.images), 1 if character_data.is_active else 0,
+                     now, now)
+                )
+                await conn.commit()
 
-            response = self.supabase.table("characters")\
-                .insert(db_data)\
-                .execute()
+            character = Character(
+                id=character_id,
+                name=character_data.name,
+                voice=character_data.voice,
+                system_prompt=character_data.system_prompt,
+                image_url=character_data.image_url,
+                images=character_data.images,
+                is_active=character_data.is_active,
+                last_message="",
+                created_at=now,
+                updated_at=now
+            )
 
-            if not response.data:
-                raise HTTPException(status_code=500, detail="Failed to create character")
+            self._character_cache[character_id] = character
+            logger.info(f"Created character: {character_id}")
+            return character
 
-            return await self.get_character(character_id)
-
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"Error creating character: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -317,34 +441,51 @@ class DatabaseDirector:
     async def update_character(self, character_id: str, character_data: CharacterUpdate) -> Character:
         """Update an existing character."""
         try:
-            update_data = {}
-            if character_data.name is not None:
-                update_data["name"] = character_data.name
-            if character_data.voice is not None:
-                update_data["voice"] = character_data.voice
-            if character_data.system_prompt is not None:
-                update_data["system_prompt"] = character_data.system_prompt
-            if character_data.image_url is not None:
-                update_data["image_url"] = character_data.image_url
-            if character_data.images is not None:
-                update_data["images"] = character_data.images
-            if character_data.is_active is not None:
-                update_data["is_active"] = character_data.is_active
-            if character_data.last_message is not None:
-                update_data["last_message"] = character_data.last_message
+            await self.get_character(character_id)
 
-            if not update_data:
+            updates = []
+            params = []
+
+            if character_data.name is not None:
+                updates.append("name = ?")
+                params.append(character_data.name)
+            if character_data.voice is not None:
+                updates.append("voice = ?")
+                params.append(character_data.voice)
+            if character_data.system_prompt is not None:
+                updates.append("system_prompt = ?")
+                params.append(character_data.system_prompt)
+            if character_data.image_url is not None:
+                updates.append("image_url = ?")
+                params.append(character_data.image_url)
+            if character_data.images is not None:
+                updates.append("images = ?")
+                params.append(json.dumps(character_data.images))
+            if character_data.is_active is not None:
+                updates.append("is_active = ?")
+                params.append(1 if character_data.is_active else 0)
+            if character_data.last_message is not None:
+                updates.append("last_message = ?")
+                params.append(character_data.last_message)
+
+            if not updates:
                 raise HTTPException(status_code=400, detail="No fields to update")
 
-            response = self.supabase.table("characters")\
-                .update(update_data)\
-                .eq("id", character_id)\
-                .execute()
+            updates.append("updated_at = ?")
+            params.append(datetime.now().isoformat())
+            params.append(character_id)
 
-            if not response.data:
-                raise HTTPException(status_code=404, detail="Character not found")
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    f"UPDATE characters SET {', '.join(updates)} WHERE id = ?",
+                    params
+                )
+                await conn.commit()
 
-            return await self.get_character(character_id)
+            character = await self.get_character(character_id)
+            self._character_cache[character_id] = character
+            logger.info(f"Updated character: {character_id}")
+            return character
 
         except HTTPException:
             raise
@@ -361,46 +502,40 @@ class DatabaseDirector:
         try:
             await self.get_character(character_id)
 
-            self.supabase.table("characters")\
-                .delete()\
-                .eq("id", character_id)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute("DELETE FROM characters WHERE id = ?", (character_id,))
+                await conn.commit()
+
+            if character_id in self._character_cache:
+                del self._character_cache[character_id]
 
             logger.info(f"Deleted character: {character_id}")
             return True
 
-        except HTTPException as e:
-            if e.status_code == 404:
-                raise
-            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error deleting character {character_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     async def search_characters(self, query: str) -> List[Character]:
         """Search characters by name."""
+        if self._cache_loaded:
+            query_lower = query.lower()
+            characters = [c for c in self._character_cache.values() if query_lower in c.name.lower()]
+            logger.info(f"Found {len(characters)} characters matching '{query}'")
+            return characters
+
         try:
-            response = self.supabase.table("characters")\
-                .select("*")\
-                .ilike("name", f"%{query}%")\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM characters WHERE name LIKE ?",
+                    (f"%{query}%",)
+                )
+                rows = await cursor.fetchall()
 
-            characters = []
-            for row in response.data:
-                character_data = {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "voice": row.get("voice") or "",
-                    "system_prompt": row.get("system_prompt") or "",
-                    "image_url": row.get("image_url") or "",
-                    "images": row.get("images") or [],
-                    "is_active": row.get("is_active") or False,
-                    "last_message": row.get("last_message") or "",
-                    "created_at": row.get("created_at"),
-                    "updated_at": row.get("updated_at")
-                }
-                characters.append(Character(**character_data))
-
+            characters = [self._row_to_character(row) for row in rows]
             logger.info(f"Found {len(characters)} characters matching '{query}'")
             return characters
 
@@ -408,33 +543,36 @@ class DatabaseDirector:
             logger.error(f"Error searching characters: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    async def refresh_character_cache(self):
+        """Reload character cache from database."""
+        self._character_cache.clear()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("SELECT * FROM characters")
+            rows = await cursor.fetchall()
+            for row in rows:
+                character = self._row_to_character(row)
+                self._character_cache[character.id] = character
+        logger.info(f"Refreshed character cache: {len(self._character_cache)} characters")
+
     ########################################
     ##--        Voice Operations        --##
     ########################################
 
     async def get_all_voices(self) -> List[Voice]:
-        """Get all voices from database."""
+        """Get all voices from cache."""
+        if self._cache_loaded:
+            voices = [v["config"] for v in self._voice_cache.values()]
+            logger.info(f"Retrieved {len(voices)} voices from cache")
+            return voices
+
         try:
-            response = self.supabase.table("voices")\
-                .select("*")\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute("SELECT * FROM voices")
+                rows = await cursor.fetchall()
 
-            voices = []
-            for row in response.data:
-                voice_data = {
-                    "voice": row["voice"],
-                    "method": row.get("method") or "",
-                    "audio_path": row.get("audio_path") or "",
-                    "text_path": row.get("text_path") or "",
-                    "speaker_desc": row.get("speaker_desc") or "",
-                    "scene_prompt": row.get("scene_prompt") or "",
-                    "audio_tokens": row.get("audio_tokens"),
-                    "id": row.get("id"),
-                    "created_at": row.get("created_at"),
-                    "updated_at": row.get("updated_at")
-                }
-                voices.append(Voice(**voice_data))
-
+            voices = [self._row_to_voice(row) for row in rows]
             logger.info(f"Retrieved {len(voices)} voices from database")
             return voices
 
@@ -444,43 +582,28 @@ class DatabaseDirector:
 
     async def get_voice(self, voice_name: str) -> Voice:
         """Get a specific voice by name."""
-        # Check cache first
-        with self._cache_lock:
-            if voice_name in self._voice_cache:
-                logger.debug(f"Retrieved voice {voice_name} from cache")
-                return self._voice_cache[voice_name]["config"]
+        if self._cache_loaded and voice_name in self._voice_cache:
+            logger.debug(f"Retrieved voice {voice_name} from cache")
+            return self._voice_cache[voice_name]["config"]
 
         try:
-            response = self.supabase.table("voices")\
-                .select("*")\
-                .eq("voice", voice_name)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM voices WHERE voice = ?",
+                    (voice_name,)
+                )
+                row = await cursor.fetchone()
 
-            if not response.data:
+            if not row:
                 raise HTTPException(status_code=404, detail="Voice not found")
 
-            row = response.data[0]
-            voice_data = {
-                "voice": row["voice"],
-                "method": row.get("method") or "",
-                "audio_path": row.get("audio_path") or "",
-                "text_path": row.get("text_path") or "",
-                "speaker_desc": row.get("speaker_desc") or "",
-                "scene_prompt": row.get("scene_prompt") or "",
-                "audio_tokens": row.get("audio_tokens"),
-                "id": row.get("id"),
-                "created_at": row.get("created_at"),
-                "updated_at": row.get("updated_at")
+            voice = self._row_to_voice(row)
+
+            self._voice_cache[voice_name] = {
+                "config": voice,
+                "audio_tokens": voice.audio_tokens
             }
-
-            voice = Voice(**voice_data)
-
-            # Add to cache
-            with self._cache_lock:
-                self._voice_cache[voice_name] = {
-                    "config": voice,
-                    "audio_tokens": voice.audio_tokens
-                }
 
             logger.info(f"Retrieved voice {voice_name} from database")
             return voice
@@ -494,36 +617,40 @@ class DatabaseDirector:
     async def create_voice(self, voice_data: VoiceCreate) -> Voice:
         """Create a new voice."""
         try:
-            db_data = {
-                "voice": voice_data.voice,
-                "method": voice_data.method,
-                "audio_path": voice_data.audio_path,
-                "text_path": voice_data.text_path,
-                "speaker_desc": voice_data.speaker_desc,
-                "scene_prompt": voice_data.scene_prompt
+            now = datetime.now().isoformat()
+            voice_id = str(uuid.uuid4())
+
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    """INSERT INTO voices (voice, method, audio_path, text_path, speaker_desc, scene_prompt, id, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (voice_data.voice, voice_data.method, voice_data.audio_path,
+                     voice_data.text_path, voice_data.speaker_desc, voice_data.scene_prompt,
+                     voice_id, now, now)
+                )
+                await conn.commit()
+
+            voice = Voice(
+                voice=voice_data.voice,
+                method=voice_data.method,
+                audio_path=voice_data.audio_path,
+                text_path=voice_data.text_path,
+                speaker_desc=voice_data.speaker_desc,
+                scene_prompt=voice_data.scene_prompt,
+                audio_tokens=None,
+                id=voice_id,
+                created_at=now,
+                updated_at=now
+            )
+
+            self._voice_cache[voice_data.voice] = {
+                "config": voice,
+                "audio_tokens": None
             }
-
-            response = self.supabase.table("voices")\
-                .insert(db_data)\
-                .execute()
-
-            if not response.data:
-                raise HTTPException(status_code=500, detail="Failed to create voice")
-
-            voice = await self.get_voice(voice_data.voice)
-
-            # Add to cache
-            with self._cache_lock:
-                self._voice_cache[voice_data.voice] = {
-                    "config": voice,
-                    "audio_tokens": None
-                }
 
             logger.info(f"Created voice: {voice.voice}")
             return voice
 
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"Error creating voice: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -531,39 +658,50 @@ class DatabaseDirector:
     async def update_voice(self, voice_name: str, voice_data: VoiceUpdate) -> Voice:
         """Update an existing voice."""
         try:
-            update_data = {}
-            if voice_data.method is not None:
-                update_data["method"] = voice_data.method
-            if voice_data.audio_path is not None:
-                update_data["audio_path"] = voice_data.audio_path
-            if voice_data.text_path is not None:
-                update_data["text_path"] = voice_data.text_path
-            if voice_data.speaker_desc is not None:
-                update_data["speaker_desc"] = voice_data.speaker_desc
-            if voice_data.scene_prompt is not None:
-                update_data["scene_prompt"] = voice_data.scene_prompt
-            if voice_data.audio_tokens is not None:
-                update_data["audio_tokens"] = voice_data.audio_tokens
+            await self.get_voice(voice_name)
 
-            if not update_data:
+            updates = []
+            params = []
+
+            if voice_data.method is not None:
+                updates.append("method = ?")
+                params.append(voice_data.method)
+            if voice_data.audio_path is not None:
+                updates.append("audio_path = ?")
+                params.append(voice_data.audio_path)
+            if voice_data.text_path is not None:
+                updates.append("text_path = ?")
+                params.append(voice_data.text_path)
+            if voice_data.speaker_desc is not None:
+                updates.append("speaker_desc = ?")
+                params.append(voice_data.speaker_desc)
+            if voice_data.scene_prompt is not None:
+                updates.append("scene_prompt = ?")
+                params.append(voice_data.scene_prompt)
+            if voice_data.audio_tokens is not None:
+                updates.append("audio_tokens = ?")
+                params.append(json.dumps(voice_data.audio_tokens))
+
+            if not updates:
                 raise HTTPException(status_code=400, detail="No fields to update")
 
-            response = self.supabase.table("voices")\
-                .update(update_data)\
-                .eq("voice", voice_name)\
-                .execute()
+            updates.append("updated_at = ?")
+            params.append(datetime.now().isoformat())
+            params.append(voice_name)
 
-            if not response.data:
-                raise HTTPException(status_code=404, detail="Voice not found")
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    f"UPDATE voices SET {', '.join(updates)} WHERE voice = ?",
+                    params
+                )
+                await conn.commit()
 
             voice = await self.get_voice(voice_name)
 
-            # Update cache
-            with self._cache_lock:
-                if voice_name in self._voice_cache:
-                    self._voice_cache[voice_name]["config"] = voice
-                    if voice_data.audio_tokens is not None:
-                        self._voice_cache[voice_name]["audio_tokens"] = voice_data.audio_tokens
+            self._voice_cache[voice_name] = {
+                "config": voice,
+                "audio_tokens": voice.audio_tokens
+            }
 
             logger.info(f"Updated voice: {voice_name}")
             return voice
@@ -579,45 +717,66 @@ class DatabaseDirector:
         try:
             await self.get_voice(voice_name)
 
-            self.supabase.table("voices")\
-                .delete()\
-                .eq("voice", voice_name)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute("DELETE FROM voices WHERE voice = ?", (voice_name,))
+                await conn.commit()
 
-            # Remove from cache
-            with self._cache_lock:
-                if voice_name in self._voice_cache:
-                    del self._voice_cache[voice_name]
+            if voice_name in self._voice_cache:
+                del self._voice_cache[voice_name]
 
             logger.info(f"Deleted voice: {voice_name}")
             return True
 
-        except HTTPException as e:
-            if e.status_code == 404:
-                raise
-            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error deleting voice {voice_name}: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
     def get_cached_audio_tokens(self, voice_name: str) -> Optional[Any]:
         """Get audio tokens from cache if available."""
-        with self._cache_lock:
-            if voice_name in self._voice_cache:
-                return self._voice_cache[voice_name]["audio_tokens"]
+        if voice_name in self._voice_cache:
+            return self._voice_cache[voice_name]["audio_tokens"]
         return None
 
     def update_cached_audio_tokens(self, voice_name: str, audio_tokens: Any):
-        """Update audio tokens in cache."""
-        with self._cache_lock:
-            if voice_name in self._voice_cache:
-                self._voice_cache[voice_name]["audio_tokens"] = audio_tokens
+        """Update audio tokens in cache and persist to database in background."""
+        if voice_name in self._voice_cache:
+            self._voice_cache[voice_name]["audio_tokens"] = audio_tokens
+            asyncio.create_task(self._persist_audio_tokens(voice_name, audio_tokens))
+
+    async def _persist_audio_tokens(self, voice_name: str, audio_tokens: Any):
+        """Background task to persist audio tokens to database."""
+        try:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    "UPDATE voices SET audio_tokens = ?, updated_at = ? WHERE voice = ?",
+                    (json.dumps(audio_tokens), datetime.now().isoformat(), voice_name)
+                )
+                await conn.commit()
+            logger.debug(f"Persisted audio tokens for voice: {voice_name}")
+        except Exception as e:
+            logger.error(f"Failed to persist audio tokens for {voice_name}: {e}")
 
     def clear_voice_cache(self):
         """Clear the voice cache."""
-        with self._cache_lock:
-            self._voice_cache.clear()
+        self._voice_cache.clear()
         logger.info("Voice cache cleared")
+
+    async def refresh_voice_cache(self):
+        """Reload voice cache from database."""
+        self._voice_cache.clear()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute("SELECT * FROM voices")
+            rows = await cursor.fetchall()
+            for row in rows:
+                voice = self._row_to_voice(row)
+                self._voice_cache[voice.voice] = {
+                    "config": voice,
+                    "audio_tokens": voice.audio_tokens
+                }
+        logger.info(f"Refreshed voice cache: {len(self._voice_cache)} voices")
 
     ########################################
     ##--    Conversation Operations     --##
@@ -639,62 +798,76 @@ class DatabaseDirector:
     ) -> Conversation:
         """Create a new conversation."""
         try:
+            conversation_id = str(uuid.uuid4())
+            now = datetime.now().isoformat()
+
             title = conversation_data.title
             if auto_generate_title and not title:
                 title = self._generate_conversation_title()
 
-            db_data = {
-                "title": title,
-                "active_characters": conversation_data.active_characters or []
-            }
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    """INSERT INTO conversations (conversation_id, title, active_characters, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (conversation_id, title, json.dumps(conversation_data.active_characters or []),
+                     now, now)
+                )
+                await conn.commit()
 
-            response = self.supabase.table("conversations")\
-                .insert(db_data)\
-                .execute()
-
-            if not response.data:
-                raise HTTPException(status_code=500, detail="Failed to create conversation")
-
-            row = response.data[0]
             conversation = Conversation(
-                conversation_id=str(row["conversation_id"]),
-                title=row.get("title"),
-                active_characters=row.get("active_characters") or [],
-                created_at=row.get("created_at"),
-                updated_at=row.get("updated_at")
+                conversation_id=conversation_id,
+                title=title,
+                active_characters=conversation_data.active_characters or [],
+                created_at=now,
+                updated_at=now
             )
 
             logger.info(f"Created conversation {conversation.conversation_id}")
             return conversation
 
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"Error creating conversation: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    async def create_conversation_background(self, conversation_data: ConversationCreate) -> str:
+        """Create conversation in background, return ID immediately."""
+        conversation_id = str(uuid.uuid4())
+        asyncio.create_task(self._create_conversation_async(conversation_id, conversation_data))
+        return conversation_id
+
+    async def _create_conversation_async(self, conversation_id: str, conversation_data: ConversationCreate):
+        """Background task to create conversation."""
+        try:
+            now = datetime.now().isoformat()
+            title = conversation_data.title or self._generate_conversation_title()
+
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    """INSERT INTO conversations (conversation_id, title, active_characters, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (conversation_id, title, json.dumps(conversation_data.active_characters or []),
+                     now, now)
+                )
+                await conn.commit()
+            logger.debug(f"Background created conversation: {conversation_id}")
+        except Exception as e:
+            logger.error(f"Background conversation creation failed: {e}")
+
     async def get_conversation(self, conversation_id: str) -> Conversation:
         """Get a specific conversation by ID."""
         try:
-            response = self.supabase.table("conversations")\
-                .select("*")\
-                .eq("conversation_id", conversation_id)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT * FROM conversations WHERE conversation_id = ?",
+                    (conversation_id,)
+                )
+                row = await cursor.fetchone()
 
-            if not response.data:
+            if not row:
                 raise HTTPException(status_code=404, detail="Conversation not found")
 
-            row = response.data[0]
-            conversation = Conversation(
-                conversation_id=str(row["conversation_id"]),
-                title=row.get("title"),
-                active_characters=row.get("active_characters") or [],
-                created_at=row.get("created_at"),
-                updated_at=row.get("updated_at")
-            )
-
-            logger.info(f"Retrieved conversation {conversation_id}")
-            return conversation
+            return self._row_to_conversation(row)
 
         except HTTPException:
             raise
@@ -709,29 +882,19 @@ class DatabaseDirector:
     ) -> List[Conversation]:
         """Get all conversations ordered by most recent first."""
         try:
-            query = self.supabase.table("conversations")\
-                .select("*")\
-                .order("updated_at", desc=True)
+            query = "SELECT * FROM conversations ORDER BY updated_at DESC"
+            params = []
 
             if limit is not None:
-                query = query.limit(limit)
+                query += " LIMIT ? OFFSET ?"
+                params.extend([limit, offset])
 
-            if offset > 0:
-                query = query.range(offset, offset + (limit or 1000) - 1)
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(query, params)
+                rows = await cursor.fetchall()
 
-            response = query.execute()
-
-            conversations = []
-            for row in response.data:
-                conversation = Conversation(
-                    conversation_id=str(row["conversation_id"]),
-                    title=row.get("title"),
-                    active_characters=row.get("active_characters") or [],
-                    created_at=row.get("created_at"),
-                    updated_at=row.get("updated_at")
-                )
-                conversations.append(conversation)
-
+            conversations = [self._row_to_conversation(row) for row in rows]
             logger.info(f"Retrieved {len(conversations)} conversations")
             return conversations
 
@@ -746,22 +909,32 @@ class DatabaseDirector:
     ) -> Conversation:
         """Update an existing conversation."""
         try:
-            update_data = {}
-            if conversation_data.title is not None:
-                update_data["title"] = conversation_data.title
-            if conversation_data.active_characters is not None:
-                update_data["active_characters"] = conversation_data.active_characters
+            updates = []
+            params = []
 
-            if not update_data:
+            if conversation_data.title is not None:
+                updates.append("title = ?")
+                params.append(conversation_data.title)
+            if conversation_data.active_characters is not None:
+                updates.append("active_characters = ?")
+                params.append(json.dumps(conversation_data.active_characters))
+
+            if not updates:
                 raise HTTPException(status_code=400, detail="No fields to update")
 
-            response = self.supabase.table("conversations")\
-                .update(update_data)\
-                .eq("conversation_id", conversation_id)\
-                .execute()
+            updates.append("updated_at = ?")
+            params.append(datetime.now().isoformat())
+            params.append(conversation_id)
 
-            if not response.data:
-                raise HTTPException(status_code=404, detail="Conversation not found")
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute(
+                    f"UPDATE conversations SET {', '.join(updates)} WHERE conversation_id = ?",
+                    params
+                )
+                await conn.commit()
+
+                if cursor.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Conversation not found")
 
             logger.info(f"Updated conversation {conversation_id}")
             return await self.get_conversation(conversation_id)
@@ -774,10 +947,7 @@ class DatabaseDirector:
 
     async def update_conversation_title(self, conversation_id: str, title: str) -> Conversation:
         """Update just the title of a conversation."""
-        return await self.update_conversation(
-            conversation_id,
-            ConversationUpdate(title=title)
-        )
+        return await self.update_conversation(conversation_id, ConversationUpdate(title=title))
 
     async def update_conversation_active_characters(
         self,
@@ -799,7 +969,6 @@ class DatabaseDirector:
         try:
             conversation = await self.get_conversation(conversation_id)
 
-            # Check if character already exists by ID
             character_ids = [c.get("id") for c in conversation.active_characters]
             if character_data.get("id") not in character_ids:
                 active_characters = conversation.active_characters + [character_data]
@@ -819,7 +988,6 @@ class DatabaseDirector:
         """Remove a character from the conversation's active_characters list."""
         try:
             conversation = await self.get_conversation(conversation_id)
-
             active_characters = [c for c in conversation.active_characters if c.get("id") != character_id]
             return await self.update_conversation_active_characters(conversation_id, active_characters)
 
@@ -830,20 +998,22 @@ class DatabaseDirector:
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation (messages will be cascade deleted)."""
         try:
-            await self.get_conversation(conversation_id)
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute("PRAGMA foreign_keys = ON")
+                cursor = await conn.execute(
+                    "DELETE FROM conversations WHERE conversation_id = ?",
+                    (conversation_id,)
+                )
+                await conn.commit()
 
-            self.supabase.table("conversations")\
-                .delete()\
-                .eq("conversation_id", conversation_id)\
-                .execute()
+                if cursor.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Conversation not found")
 
             logger.info(f"Deleted conversation {conversation_id}")
             return True
 
-        except HTTPException as e:
-            if e.status_code == 404:
-                raise
-            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error deleting conversation {conversation_id}: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -865,7 +1035,7 @@ class DatabaseDirector:
 
         except Exception as e:
             logger.error(f"Error auto-updating title for conversation {conversation_id}: {e}")
-            return conversation
+            raise
 
     ########################################
     ##--       Message Operations       --##
@@ -874,85 +1044,115 @@ class DatabaseDirector:
     async def create_message(self, message_data: MessageCreate) -> Message:
         """Create a single message."""
         try:
-            db_data = {
-                "conversation_id": message_data.conversation_id,
-                "role": message_data.role,
-                "content": message_data.content,
-                "name": message_data.name,
-                "character_id": message_data.character_id
-            }
+            message_id = str(uuid.uuid4())
+            now = datetime.now().isoformat()
 
-            response = self.supabase.table("messages")\
-                .insert(db_data)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    """INSERT INTO messages (message_id, conversation_id, role, name, content, character_id, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (message_id, message_data.conversation_id, message_data.role,
+                     message_data.name, message_data.content, message_data.character_id,
+                     now, now)
+                )
+                await conn.commit()
 
-            if not response.data:
-                raise HTTPException(status_code=500, detail="Failed to create message")
-
-            row = response.data[0]
             message = Message(
-                message_id=str(row["message_id"]),
-                conversation_id=str(row["conversation_id"]),
-                role=row["role"],
-                name=row.get("name"),
-                content=row["content"],
-                character_id=row.get("character_id"),
-                created_at=row.get("created_at"),
-                updated_at=row.get("updated_at")
+                message_id=message_id,
+                conversation_id=message_data.conversation_id,
+                role=message_data.role,
+                name=message_data.name,
+                content=message_data.content,
+                character_id=message_data.character_id,
+                created_at=now,
+                updated_at=now
             )
 
             logger.info(f"Created message {message.message_id} in conversation {message.conversation_id}")
             return message
 
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"Error creating message: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
+    def create_message_background(self, message_data: MessageCreate) -> str:
+        """Create message in background (fire-and-forget). Returns message_id immediately."""
+        message_id = str(uuid.uuid4())
+        asyncio.create_task(self._create_message_async(message_id, message_data))
+        return message_id
+
+    async def _create_message_async(self, message_id: str, message_data: MessageCreate):
+        """Background task to create message."""
+        try:
+            now = datetime.now().isoformat()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    """INSERT INTO messages (message_id, conversation_id, role, name, content, character_id, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (message_id, message_data.conversation_id, message_data.role,
+                     message_data.name, message_data.content, message_data.character_id,
+                     now, now)
+                )
+                await conn.commit()
+            logger.debug(f"Background created message: {message_id}")
+        except Exception as e:
+            logger.error(f"Background message creation failed for conversation {message_data.conversation_id}: {e}")
+
     async def create_messages_batch(self, messages: List[MessageCreate]) -> List[Message]:
         """Create multiple messages in a single batch operation."""
         try:
-            db_data = [
-                {
-                    "conversation_id": msg.conversation_id,
-                    "role": msg.role,
-                    "content": msg.content,
-                    "name": msg.name,
-                    "character_id": msg.character_id
-                }
-                for msg in messages
-            ]
-
-            response = self.supabase.table("messages")\
-                .insert(db_data)\
-                .execute()
-
-            if not response.data:
-                raise HTTPException(status_code=500, detail="Failed to create messages")
-
+            now = datetime.now().isoformat()
             created_messages = []
-            for row in response.data:
-                message = Message(
-                    message_id=str(row["message_id"]),
-                    conversation_id=str(row["conversation_id"]),
-                    role=row["role"],
-                    name=row.get("name"),
-                    content=row["content"],
-                    character_id=row.get("character_id"),
-                    created_at=row.get("created_at"),
-                    updated_at=row.get("updated_at")
-                )
-                created_messages.append(message)
+
+            async with aiosqlite.connect(DB_PATH) as conn:
+                for msg in messages:
+                    message_id = str(uuid.uuid4())
+                    await conn.execute(
+                        """INSERT INTO messages (message_id, conversation_id, role, name, content, character_id, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (message_id, msg.conversation_id, msg.role,
+                         msg.name, msg.content, msg.character_id, now, now)
+                    )
+                    created_messages.append(Message(
+                        message_id=message_id,
+                        conversation_id=msg.conversation_id,
+                        role=msg.role,
+                        name=msg.name,
+                        content=msg.content,
+                        character_id=msg.character_id,
+                        created_at=now,
+                        updated_at=now
+                    ))
+                await conn.commit()
 
             logger.info(f"Created {len(created_messages)} messages in batch")
             return created_messages
 
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"Error creating messages batch: {e}")
             raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+    def create_messages_batch_background(self, messages: List[MessageCreate]):
+        """Create multiple messages in background (fire-and-forget)."""
+        asyncio.create_task(self._create_messages_batch_async(messages))
+
+    async def _create_messages_batch_async(self, messages: List[MessageCreate]):
+        """Background task to create messages in batch."""
+        try:
+            now = datetime.now().isoformat()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                for msg in messages:
+                    message_id = str(uuid.uuid4())
+                    await conn.execute(
+                        """INSERT INTO messages (message_id, conversation_id, role, name, content, character_id, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (message_id, msg.conversation_id, msg.role,
+                         msg.name, msg.content, msg.character_id, now, now)
+                    )
+                await conn.commit()
+            logger.debug(f"Background created {len(messages)} messages in batch")
+        except Exception as e:
+            logger.error(f"Background batch message creation failed: {e}")
 
     async def get_messages(
         self,
@@ -962,33 +1162,19 @@ class DatabaseDirector:
     ) -> List[Message]:
         """Get messages for a conversation with optional pagination."""
         try:
-            query = self.supabase.table("messages")\
-                .select("*")\
-                .eq("conversation_id", conversation_id)\
-                .order("created_at", desc=False)
+            query = "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC"
+            params = [conversation_id]
 
             if limit is not None:
-                query = query.limit(limit)
+                query += " LIMIT ? OFFSET ?"
+                params.extend([limit, offset])
 
-            if offset > 0:
-                query = query.range(offset, offset + (limit or 1000) - 1)
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(query, params)
+                rows = await cursor.fetchall()
 
-            response = query.execute()
-
-            messages = []
-            for row in response.data:
-                message = Message(
-                    message_id=str(row["message_id"]),
-                    conversation_id=str(row["conversation_id"]),
-                    role=row["role"],
-                    name=row.get("name"),
-                    content=row["content"],
-                    character_id=row.get("character_id"),
-                    created_at=row.get("created_at"),
-                    updated_at=row.get("updated_at")
-                )
-                messages.append(message)
-
+            messages = [self._row_to_message(row) for row in rows]
             logger.info(f"Retrieved {len(messages)} messages for conversation {conversation_id}")
             return messages
 
@@ -999,28 +1185,17 @@ class DatabaseDirector:
     async def get_recent_messages(self, conversation_id: str, n: int = 10) -> List[Message]:
         """Get the last N messages from a conversation."""
         try:
-            response = self.supabase.table("messages")\
-                .select("*")\
-                .eq("conversation_id", conversation_id)\
-                .order("created_at", desc=True)\
-                .limit(n)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """SELECT * FROM messages WHERE conversation_id = ?
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (conversation_id, n)
+                )
+                rows = await cursor.fetchall()
 
             # Reverse to get chronological order
-            messages = []
-            for row in reversed(response.data):
-                message = Message(
-                    message_id=str(row["message_id"]),
-                    conversation_id=str(row["conversation_id"]),
-                    role=row["role"],
-                    name=row.get("name"),
-                    content=row["content"],
-                    character_id=row.get("character_id"),
-                    created_at=row.get("created_at"),
-                    updated_at=row.get("updated_at")
-                )
-                messages.append(message)
-
+            messages = [self._row_to_message(row) for row in reversed(rows)]
             logger.info(f"Retrieved last {len(messages)} messages for conversation {conversation_id}")
             return messages
 
@@ -1031,29 +1206,19 @@ class DatabaseDirector:
     async def get_last_message(self, conversation_id: str) -> Optional[Message]:
         """Get the last message from a conversation."""
         try:
-            response = self.supabase.table("messages")\
-                .select("*")\
-                .eq("conversation_id", conversation_id)\
-                .order("created_at", desc=True)\
-                .limit(1)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    """SELECT * FROM messages WHERE conversation_id = ?
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (conversation_id,)
+                )
+                row = await cursor.fetchone()
 
-            if not response.data:
+            if not row:
                 return None
 
-            row = response.data[0]
-            message = Message(
-                message_id=str(row["message_id"]),
-                conversation_id=str(row["conversation_id"]),
-                role=row["role"],
-                name=row.get("name"),
-                content=row["content"],
-                character_id=row.get("character_id"),
-                created_at=row.get("created_at"),
-                updated_at=row.get("updated_at")
-            )
-
-            return message
+            return self._row_to_message(row)
 
         except Exception as e:
             logger.error(f"Error getting last message for conversation {conversation_id}: {e}")
@@ -1062,12 +1227,14 @@ class DatabaseDirector:
     async def get_message_count(self, conversation_id: str) -> int:
         """Get the total number of messages in a conversation."""
         try:
-            response = self.supabase.table("messages")\
-                .select("message_id", count="exact")\
-                .eq("conversation_id", conversation_id)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                    (conversation_id,)
+                )
+                row = await cursor.fetchone()
 
-            count = response.count if hasattr(response, 'count') and response.count is not None else len(response.data)
+            count = row[0] if row else 0
             logger.info(f"Conversation {conversation_id} has {count} messages")
             return count
 
@@ -1078,10 +1245,9 @@ class DatabaseDirector:
     async def delete_message(self, message_id: str) -> bool:
         """Delete a single message."""
         try:
-            response = self.supabase.table("messages")\
-                .delete()\
-                .eq("message_id", message_id)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute("DELETE FROM messages WHERE message_id = ?", (message_id,))
+                await conn.commit()
 
             logger.info(f"Deleted message {message_id}")
             return True
@@ -1093,10 +1259,12 @@ class DatabaseDirector:
     async def delete_messages_for_conversation(self, conversation_id: str) -> bool:
         """Delete all messages for a conversation."""
         try:
-            self.supabase.table("messages")\
-                .delete()\
-                .eq("conversation_id", conversation_id)\
-                .execute()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    "DELETE FROM messages WHERE conversation_id = ?",
+                    (conversation_id,)
+                )
+                await conn.commit()
 
             logger.info(f"Deleted messages for conversation {conversation_id}")
             return True
@@ -1110,5 +1278,4 @@ class DatabaseDirector:
 ##--      Module-Level Instance     --##
 ########################################
 
-# Create a default instance for easy importing
 db = DatabaseDirector()

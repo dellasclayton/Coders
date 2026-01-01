@@ -1,13 +1,13 @@
 /**
  * characters.js - Character Management Functionality
  * Handles character creation, editing, deletion, and display
- * Now using character cache and real-time sync for instant access
+ * Uses character cache for instant access with SQLite backend
  */
 
-// Import cache and real-time sync
+// Import cache and utilities
 import { characterCache } from './characterCache.js';
-import { realtimeSync } from './realtimeSync.js';
-import { handleSupabaseError } from './supabase.js';
+import { handleDbError } from './db.js';
+import * as websocket from './websocket.js';
 
 // Character data storage (populated from cache)
 let characters = [];
@@ -26,16 +26,13 @@ export async function initCharacters() {
   // Setup event listeners
   setupEventListeners();
 
-  // Setup real-time sync event handlers
-  setupRealtimeSyncHandlers();
+  // Setup cache event handlers
+  setupCacheEventHandlers();
 
   // Load data from cache (and initialize if needed)
   await loadData();
 
-  // Start real-time sync
-  realtimeSync.start();
-
-  console.log('Characters page initialized with cache and real-time sync');
+  console.log('Characters page initialized');
 }
 
 /**
@@ -69,7 +66,7 @@ async function loadData() {
     populateVoiceDropdown();
   } catch (error) {
     console.error('Error loading data:', error);
-    const errorMessage = handleSupabaseError(error);
+    const errorMessage = handleDbError(error);
     showNotification('Error Loading Data', errorMessage, 'error');
 
     // Render empty state
@@ -83,20 +80,19 @@ async function loadData() {
 }
 
 /**
- * Setup real-time sync event handlers for automatic UI updates
+ * Setup cache event handlers for UI updates
  */
-function setupRealtimeSyncHandlers() {
-  // Character created (by external source - e.g., another tab)
-  characterCache.on('character:created:external', (character) => {
-    console.log('External character created, updating UI:', character.id);
+function setupCacheEventHandlers() {
+  // Character created
+  characterCache.on('character:created', (character) => {
+    console.log('Character created:', character.id);
     characters = characterCache.getAllCharacters();
     renderCharacterList();
-    showNotification('Character Added', `${character.name} was created`, 'info');
   });
 
-  // Character updated (by external source)
-  characterCache.on('character:updated:external', (character) => {
-    console.log('External character updated, updating UI:', character.id);
+  // Character updated
+  characterCache.on('character:updated', (character) => {
+    console.log('Character updated:', character.id);
     characters = characterCache.getAllCharacters();
     renderCharacterList();
 
@@ -106,36 +102,30 @@ function setupRealtimeSyncHandlers() {
     }
   });
 
-  // Character deleted (by external source)
-  characterCache.on('character:deleted:external', ({ id }) => {
-    console.log('External character deleted, updating UI:', id);
+  // Character deleted
+  characterCache.on('character:deleted', ({ id }) => {
+    console.log('Character deleted:', id);
     characters = characterCache.getAllCharacters();
     renderCharacterList();
-
-    // If currently viewing this character, close the card
-    if (currentCharacter && currentCharacter.id === id) {
-      hideCharacterCard();
-      showNotification('Character Deleted', 'The character you were viewing was deleted', 'warning');
-    }
   });
 
-  // Voice created (by external source)
-  characterCache.on('voice:created:external', (voice) => {
-    console.log('External voice created, updating UI:', voice.voice);
+  // Voice created
+  characterCache.on('voice:created', (voice) => {
+    console.log('Voice created:', voice.voice);
     voices = characterCache.getAllVoices();
     populateVoiceDropdown();
   });
 
-  // Voice updated (by external source)
-  characterCache.on('voice:updated:external', (voice) => {
-    console.log('External voice updated, updating UI:', voice.voice);
+  // Voice updated
+  characterCache.on('voice:updated', (voice) => {
+    console.log('Voice updated:', voice.voice);
     voices = characterCache.getAllVoices();
     populateVoiceDropdown();
   });
 
-  // Voice deleted (by external source)
-  characterCache.on('voice:deleted:external', ({ voice }) => {
-    console.log('External voice deleted, updating UI:', voice);
+  // Voice deleted
+  characterCache.on('voice:deleted', ({ voice }) => {
+    console.log('Voice deleted:', voice);
     voices = characterCache.getAllVoices();
     populateVoiceDropdown();
   });
@@ -188,7 +178,7 @@ function populateVoiceDropdown() {
   // Clear existing options except the first placeholder
   voiceSelect.innerHTML = '<option value="">Select voice</option>';
 
-  // Add voices from Supabase
+  // Add voices from cache
   voices.forEach(voice => {
     const option = document.createElement('option');
     option.value = voice.voice;
@@ -793,7 +783,7 @@ async function handleCreateVoice() {
     );
   } catch (error) {
     console.error('Error creating voice:', error);
-    const errorMessage = handleSupabaseError(error);
+    const errorMessage = handleDbError(error);
     showNotification('Error Creating Voice', errorMessage, 'error');
   } finally {
     // Re-enable button
@@ -826,7 +816,7 @@ async function saveCharacter() {
     return;
   }
 
-  // Prepare character data for Supabase
+  // Prepare character data
   const characterData = {
     name: characterName,
     system_prompt: systemPromptInput?.value || '',
@@ -875,7 +865,7 @@ async function saveCharacter() {
     hideCharacterCard();
   } catch (error) {
     console.error('Error saving character:', error);
-    const errorMessage = handleSupabaseError(error);
+    const errorMessage = handleDbError(error);
     showNotification(
       'Error Saving Character',
       errorMessage,
@@ -936,7 +926,7 @@ async function deleteCharacter() {
     hideCharacterCard();
   } catch (error) {
     console.error('Error deleting character:', error);
-    const errorMessage = handleSupabaseError(error);
+    const errorMessage = handleDbError(error);
     showNotification(
       'Error Deleting Character',
       errorMessage,
@@ -1008,7 +998,7 @@ async function handleChatWithCharacter() {
 
   } catch (error) {
     console.error('Error activating character:', error);
-    const errorMessage = handleSupabaseError(error);
+    const errorMessage = handleDbError(error);
     showNotification('Error Activating Character', errorMessage, 'error');
   } finally {
     // Re-enable button

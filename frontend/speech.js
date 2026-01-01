@@ -4,7 +4,7 @@
  */
 
 import { characterCache } from './characterCache.js';
-import { handleSupabaseError } from './supabase.js';
+import { handleDbError } from './db.js';
 
 let isSpeechInitialized = false;
 
@@ -180,7 +180,7 @@ async function handleCreateVoice() {
 
     } catch (error) {
         console.error('Error creating voice:', error);
-        const errorMessage = handleSupabaseError(error);
+        const errorMessage = handleDbError(error);
         showNotification('Error Creating Voice', errorMessage, 'error');
     } finally {
         if (createBtn) {

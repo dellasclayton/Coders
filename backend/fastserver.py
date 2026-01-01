@@ -25,7 +25,6 @@ from collections.abc import Awaitable
 from threading import Thread, Event, Lock
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from supabase import create_client, Client
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,11 +40,6 @@ from backend.boson_multimodal.data_types import ChatMLSample, Message, AudioCont
 from backend.boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 
 from backend.database_director import (db, Character, CharacterCreate, CharacterUpdate, Voice, VoiceCreate, VoiceUpdate, Conversation, ConversationCreate, ConversationUpdate, Message as ConversationMessage, MessageCreate)
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jslevsbvapopncjehhva.supabase.co")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpzbGV2c2J2YXBvcG5jamVoaHZhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgwNTQwOTMsImV4cCI6MjA3MzYzMDA5M30.DotbJM3IrvdVzwfScxOtsSpxq0xsj7XxI3DvdiqDSrE")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 logging.basicConfig(filename="filelogger.log", format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -264,9 +258,13 @@ class ChatLLM:
         self.active_characters: List[Character] = []
 
     async def start_new_chat(self):
-        """Start a new chat session"""
+        """Start a new chat session and persist to database"""
         self.conversation_history = []
-        self.conversation_id = str(uuid.uuid4())
+        # Create conversation in background, get ID immediately
+        active_char_data = [{"id": c.id, "name": c.name} for c in self.active_characters]
+        self.conversation_id = db.create_conversation_background(
+            ConversationCreate(active_characters=active_char_data)
+        )
 
     async def get_active_characters(self) -> List[Character]:
         """Get active characters from database"""
@@ -414,6 +412,15 @@ class ChatLLM:
 
         self.conversation_history.append({"role": "user", "name": "Jay", "content": user_message})
 
+        # Save user message to database in background (non-blocking)
+        if self.conversation_id:
+            db.create_message_background(MessageCreate(
+                conversation_id=self.conversation_id,
+                role="user",
+                name="Jay",
+                content=user_message
+            ))
+
         responding_characters = self.parse_character_mentions(message=user_message, active_characters=self.active_characters)
 
         model_settings = self.get_model_settings()
@@ -436,6 +443,16 @@ class ChatLLM:
                 response_wrapped = self.wrap_character_tags(full_response, character.name)
 
                 self.conversation_history.append({"role": "assistant", "name": character.name, "content": response_wrapped})
+
+                # Save assistant message to database in background (non-blocking)
+                if self.conversation_id:
+                    db.create_message_background(MessageCreate(
+                        conversation_id=self.conversation_id,
+                        role="assistant",
+                        name=character.name,
+                        content=full_response,
+                        character_id=character.id
+                    ))
 
     async def stream_character_response(self, messages: List[Dict[str, str]], character: Character, message_id: str,
                                         model_settings: ModelSettings, sentence_queue: asyncio.Queue,
@@ -792,7 +809,11 @@ class WebSocketManager:
         await websocket.accept()
         self.websocket = websocket
 
-        await self.start_pipeline() # <============================= boom
+        # Start a new conversation for this session
+        if self.chat:
+            await self.chat.start_new_chat()
+
+        await self.start_pipeline()
 
         logger.info("WebSocket connected, pipeline started")
 
@@ -850,6 +871,7 @@ class WebSocketManager:
             elif message_type == "clear_history":
                 if self.chat:
                     self.chat.clear_conversation_history()
+                    await self.chat.start_new_chat()  # Start fresh conversation
                 await self.send_text_to_client({"type": "history_cleared"})
 
             elif message_type == "interrupt":
@@ -1072,6 +1094,7 @@ ws_manager = WebSocketManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Starting up services...")
+    await db.init_database()
     await ws_manager.initialize()
     print("All services initialized!")
     yield

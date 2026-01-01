@@ -512,31 +512,7 @@ function loadPage(page, container) {
 
     speech: `
       <div class="speech-page">
-        <!-- Left Column: Content -->
-        <div class="speech-content-column">
-          <div class="voice-list-card">
-            <div class="voice-list-header">
-              <div>
-                <h3>Voices</h3>
-                <p class="voice-list-subtitle">Saved voices in SQLite</p>
-              </div>
-              <button class="voice-list-action-btn" id="speech-new-voice-btn">New Voice</button>
-            </div>
-            <div class="voice-list" id="speech-voice-list"></div>
-            <div class="voice-list-empty" id="speech-voice-empty">
-              <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                <line x1="12" y1="19" x2="12" y2="22"/>
-                <line x1="8" y1="22" x2="16" y2="22"/>
-              </svg>
-              <h4>No voices yet</h4>
-              <p>Create your first voice to see it here.</p>
-            </div>
-          </div>
-        </div>
-
-        <!-- Right Column: Voice Creator -->
+        <!-- Left Column: Voice Creator -->
         <div class="speech-creator-column">
           <div class="voice-generator-card">
             <div class="voice-generator-header">
@@ -545,7 +521,7 @@ function loadPage(page, container) {
               </svg>
               <h2>Create Voice</h2>
             </div>
-            
+
             <div class="voice-generator-body">
                 <div class="speech-form-group">
                     <label class="speech-form-label">Voice Name</label>
@@ -583,14 +559,14 @@ function loadPage(page, container) {
 
                 <div class="speech-form-group">
                     <label class="speech-form-label">Audio Path (Clone)</label>
-                    <input type="text" class="speech-form-input" id="speech-audio-path" placeholder="Path to audio file (e.g. D:\Voices\sample.wav)">
+                    <input type="text" class="speech-form-input" id="speech-audio-path" placeholder="Path to audio file (e.g. D:\\Voices\\sample.wav)">
                 </div>
 
                 <div class="speech-form-group">
                     <label class="speech-form-label">Text Path (Clone)</label>
                     <input type="text" class="speech-form-input" id="speech-text-path" placeholder="Path to transcript file">
                 </div>
-                
+
                 <div class="speech-form-group">
                     <label class="speech-form-label">Scene Prompt (Optional)</label>
                     <textarea class="speech-form-textarea" id="speech-scene-prompt" placeholder="Optional context for the voice generation..."></textarea>
@@ -603,6 +579,106 @@ function loadPage(page, container) {
                   </button>
                   <button class="delete-voice-btn" id="speech-delete-btn" disabled>Delete Voice</button>
                 </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Middle Column: Voice Directory -->
+        <div class="speech-voices-column">
+          <div class="voices-directory-card">
+            <div class="voices-directory-header">
+              <h3>Voices</h3>
+            </div>
+            <div class="voices-directory-body">
+              <div class="voice-directory-list" id="speech-voice-list"></div>
+              <div class="voice-directory-empty" id="speech-voice-empty">
+                <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                  <line x1="12" y1="19" x2="12" y2="22"/>
+                  <line x1="8" y1="22" x2="16" y2="22"/>
+                </svg>
+                <h4>No voices yet</h4>
+                <p>Create your first voice using the form on the left.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right Column: Preview & Controls -->
+        <div class="speech-preview-column">
+          <!-- Text to Synthesize -->
+          <div class="speech-synthesize-card">
+            <div class="speech-synthesize-header">
+              <h3>Text to Read/Synthesize</h3>
+            </div>
+            <div class="speech-synthesize-body">
+              <textarea class="speech-synthesize-textarea" id="speech-synthesize-text" placeholder="Enter text to synthesize with the selected voice..."></textarea>
+            </div>
+          </div>
+
+          <!-- Audio Controls -->
+          <div class="speech-controls-card">
+            <div class="speech-controls-header">
+              <h3>Controls</h3>
+            </div>
+            <div class="speech-controls-body">
+              <div class="speech-audio-player">
+                <!-- Waveform Visualization -->
+                <div class="audio-waveform">
+                  <div class="waveform-placeholder">
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                    <div class="waveform-bar"></div>
+                  </div>
+                </div>
+
+                <!-- Progress Bar -->
+                <div class="audio-progress">
+                  <span class="audio-time" id="audio-current-time">0:00</span>
+                  <div class="audio-progress-bar">
+                    <div class="audio-progress-fill" id="audio-progress-fill"></div>
+                  </div>
+                  <span class="audio-time" id="audio-duration">0:00</span>
+                </div>
+
+                <!-- Playback Controls -->
+                <div class="audio-buttons">
+                  <button class="audio-btn" id="audio-skip-back" title="Skip Back">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0019 16V8a1 1 0 00-1.6-.8l-5.333 4zM4.066 11.2a1 1 0 000 1.6l5.334 4A1 1 0 0011 16V8a1 1 0 00-1.6-.8l-5.334 4z"/>
+                    </svg>
+                  </button>
+                  <button class="audio-btn play-btn" id="audio-play" title="Play">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/>
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                  </button>
+                  <button class="audio-btn" id="audio-skip-forward" title="Skip Forward">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11.933 12.8a1 1 0 000-1.6L6.6 7.2A1 1 0 005 8v8a1 1 0 001.6.8l5.333-4zM19.933 12.8a1 1 0 000-1.6l-5.333-4A1 1 0 0013 8v8a1 1 0 001.6.8l5.333-4z"/>
+                    </svg>
+                  </button>
+                </div>
+
+                <!-- Synthesize Button -->
+                <button class="synthesize-btn" id="speech-synthesize-btn">
+                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"/>
+                  </svg>
+                  Synthesize
+                </button>
+              </div>
             </div>
           </div>
         </div>

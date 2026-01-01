@@ -561,7 +561,7 @@ class Speech:
         self._chunk_size = 14
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.voice_dir = "backend/voices"
+        self.voice_dir = "/workspace/tts/Code/backend/voices"
 
     async def initialize(self):
 
@@ -738,26 +738,27 @@ class Speech:
             except Exception as e:
                 logger.warning(f"Error flushing remaining audio: {e}")
 
-    def get_available_voices(self):
-        """Get list of available voices in format expected by frontend"""
-        if not os.path.exists(self.voice_dir):
-            return []
+    async def get_available_voices(self):
+        """Get list of available voices from SQLite for TTS configuration."""
+        voices = await db.get_all_voices()
 
-        voices = []
-        for file in os.listdir(self.voice_dir):
-            if file.endswith('.wav'):
-                voice = file[:-4]  # Remove .wav extension
-                # Only include if matching .txt file exists
-                if os.path.exists(os.path.join(self.voice_dir, f"{voice}.txt")):
-                    # Format: {id: "voice_name", name: "Voice Name"}
-                    display_name = voice.replace('_', ' ').title()
-                    voices.append({
-                        "id": voice,
-                        "name": display_name
-                    })
+        available = []
+        for voice in voices:
+            audio_path = voice.audio_path or os.path.join(self.voice_dir, f"{voice.voice}.wav")
+            text_path = voice.text_path or os.path.join(self.voice_dir, f"{voice.voice}.txt")
 
-        voices.sort(key=lambda v: v['name'])
-        return voices
+            available.append({
+                "id": voice.voice,
+                "name": voice.voice,
+                "method": voice.method,
+                "audio_path": audio_path,
+                "text_path": text_path,
+                "speaker_desc": voice.speaker_desc,
+                "scene_prompt": voice.scene_prompt,
+            })
+
+        available.sort(key=lambda v: v['name'])
+        return available
 
 ########################################
 ##--        WebSocket Manager       --##
@@ -1003,6 +1004,7 @@ class WebSocketManager:
                             "type": "voice_updated",
                             "data": voice.model_dump()
                         })
+                        await self.refresh_active_characters()
                     except HTTPException as e:
                         await self.send_text_to_client({
                             "type": "db_error",
@@ -1017,6 +1019,7 @@ class WebSocketManager:
                         "type": "voice_deleted",
                         "data": {"voice": voice_name}
                     })
+                    await self.refresh_active_characters()
                 except HTTPException as e:
                     await self.send_text_to_client({
                         "type": "db_error",

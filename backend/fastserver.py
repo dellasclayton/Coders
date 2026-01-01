@@ -262,7 +262,7 @@ class ChatLLM:
         self.conversation_history = []
         # Create conversation in background, get ID immediately
         active_char_data = [{"id": c.id, "name": c.name} for c in self.active_characters]
-        self.conversation_id = db.create_conversation_background(
+        self.conversation_id = await db.create_conversation_background(
             ConversationCreate(active_characters=active_char_data)
         )
 

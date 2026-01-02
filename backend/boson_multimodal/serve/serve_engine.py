@@ -291,43 +291,19 @@ class HiggsAudioServeEngine:
 
         # Configure the audio inputs
         audio_ids_l = []
-        precomputed_audio_ids = None
-        misc = getattr(chat_ml_sample, "misc", None)
-        if isinstance(misc, dict):
-            if "audio_ids" in misc:
-                precomputed_audio_ids = misc["audio_ids"]
-            elif "generated_audio_ids" in misc:
-                precomputed_audio_ids = misc["generated_audio_ids"]
-
-        if precomputed_audio_ids is not None:
-            if not isinstance(precomputed_audio_ids, list):
-                raise TypeError("ChatMLSample.misc['audio_ids'] must be a list of audio token tensors.")
-            if len(precomputed_audio_ids) != len(audio_contents):
-                raise ValueError(
-                    "Mismatch between precomputed audio ids and audio contents in ChatMLSample messages."
+        for audio_content in audio_contents:
+            if audio_content.audio_url not in ["placeholder", ""]:
+                raw_audio, _ = librosa.load(audio_content.audio_url, sr=self.audio_tokenizer.sampling_rate)
+            elif audio_content.raw_audio is not None:
+                raw_audio, _ = librosa.load(
+                    BytesIO(base64.b64decode(audio_content.raw_audio)), sr=self.audio_tokenizer.sampling_rate
                 )
-            for audio_ids in precomputed_audio_ids:
-                if isinstance(audio_ids, torch.Tensor):
-                    audio_tensor = audio_ids.detach().cpu().to(torch.long)
-                else:
-                    audio_tensor = torch.as_tensor(audio_ids, dtype=torch.long)
-                if audio_tensor.ndim != 2:
-                    raise ValueError("Each precomputed audio id entry must be a 2D tensor.")
-                audio_ids_l.append(audio_tensor)
-        else:
-            for audio_content in audio_contents:
-                if audio_content.audio_url not in ["placeholder", ""]:
-                    raw_audio, _ = librosa.load(audio_content.audio_url, sr=self.audio_tokenizer.sampling_rate)
-                elif audio_content.raw_audio is not None:
-                    raw_audio, _ = librosa.load(
-                        BytesIO(base64.b64decode(audio_content.raw_audio)), sr=self.audio_tokenizer.sampling_rate
-                    )
-                else:
-                    raw_audio = None
+            else:
+                raw_audio = None
 
-                if raw_audio is not None:
-                    audio_ids = self.audio_tokenizer.encode(raw_audio, self.audio_tokenizer.sampling_rate)
-                    audio_ids_l.append(audio_ids.squeeze(0).cpu())
+            if raw_audio is not None:
+                audio_ids = self.audio_tokenizer.encode(raw_audio, self.audio_tokenizer.sampling_rate)
+                audio_ids_l.append(audio_ids.squeeze(0).cpu())
 
         if len(audio_ids_l) > 0:
             audio_ids_start = torch.tensor(

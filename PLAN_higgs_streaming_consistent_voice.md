@@ -100,17 +100,17 @@ async def generate_delta_stream_with_context(
 
 ### Step 2: Implement Context Building Logic
 
-Following `generation.py` exactly:
+Following `generation.py` exactly (without mutating input):
 
 ```python
-# Build generation messages with current text
-current_generation_messages = generation_messages.copy()
-current_generation_messages.append(Message(role="user", content=text))
+# Build generation messages with current text (don't mutate input)
+current_user_message = Message(role="user", content=text)
+full_generation_messages = generation_messages + [current_user_message]
 
-# Build full ChatML sample
-chatml_sample = ChatMLSample(messages=messages + current_generation_messages)
+# Build full ChatML sample: initial messages + accumulated generation messages
+chatml_sample = ChatMLSample(messages=messages + full_generation_messages)
 
-# Build audio context
+# Build audio context: initial audio_ids + all generated audio so far
 context_audio_ids = audio_ids + generated_audio_ids
 ```
 

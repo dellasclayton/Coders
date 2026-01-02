@@ -642,7 +642,7 @@ class Speech:
     async def load_voice_method(self, voice: str):
         """Load voice method"""
 
-        # checks voice "method" via db
+        # checks voice "method" for character voice via db 
         # if method = clone, we use prepare_voice_clone
         # if method = profile, we use prepare_voice_profile
     
@@ -664,14 +664,21 @@ class Speech:
 
         return messages
 
-    async def prepare_voice_profile(self, scene_prompt: str, speaker_desc: str):
+    async def prepare_voice_profile(self, scene_prompt: str, speaker_desc: str, text: str):
         """"""
 
         # write simple query to get scene_prompt and speaker_desc from SQLite.
-        # need to add rest of messages/pairs for consistent voice.
+        # need to verify the below should be messages = or system_message = or other.
+        # not sure about user content = text.
+        # must verify function as a whole.
 
-        system_message = Message(role="system", 
-                                content=f"Generate audio following instruction.\n\n<|scene_desc_start|>\n{scene_prompt}\n\n" + "\n".join(speaker_desc) + "\n<|scene_desc_end|>")
+        messages = [
+            Message(role="system",
+                    content=f"Generate audio following instruction.\n\n<|scene_desc_start|>\n{scene_prompt}\n\n" + "\n".join(speaker_desc) + "\n<|scene_desc_end|>"),
+
+            Message(role="user", content=text),
+            Message(role="assistant", content=AudioContent(audio_url=""))
+        ]
 
 
     async def get_voice_profile_audio_tokens():

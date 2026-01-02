@@ -557,7 +557,7 @@ class Speech:
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
 
-        self.sample_rate = 24000
+        self.sample_rate = 2400
         self._chunk_size = 14
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -639,9 +639,18 @@ class Speech:
                 logger.error(f"[TTS] Error generating audio: {e}")
                 continue
 
-    def load_voice_reference(self, voice: str):
+    async def load_voice_method(self, voice: str):
+        """Load voice method"""
+
+        # checks voice "method" via db
+        # if method = clone, we use prepare_voice_clone
+        # if method = profile, we use prepare_voice_profile
+    
+
+    async def prepare_voice_clone(self, voice: str):
         """Load reference audio and text for voice cloning"""
 
+        # should be changed to get audio_path and text_path from db. still leads to same place and still has to read text.
         audio_path = os.path.join(self.voice_dir, f"{voice}.wav")
         text_path = os.path.join(self.voice_dir, f"{voice}.txt")
 
@@ -655,10 +664,27 @@ class Speech:
 
         return messages
 
+    async def prepare_voice_profile(self, scene_prompt: str, speaker_desc: str):
+        """"""
+
+        # write simple query to get scene_prompt and speaker_desc from SQLite.
+        # need to add rest of messages/pairs for consistent voice.
+
+        system_message = Message(role="system", 
+                                content=f"Generate audio following instruction.\n\n<|scene_desc_start|>\n{scene_prompt}\n\n" + "\n".join(speaker_desc) + "\n<|scene_desc_end|>")
+
+
+    async def get_voice_profile_audio_tokens():
+        """get previously generated audio tokens/ids for voice consistency"""
+
+        # audio tokens from previous sessions stored in SQLite "voices" table in column "audio_tokens" as serialized json.
+
+
+
     async def generate_audio_for_sentence(self, text: str, voice: str) -> AsyncGenerator[bytes, None]:
         """Generate audio for text using Higgs streaming"""
 
-        messages = self.load_voice_reference(voice)
+        messages = self.load_voice_method(voice)
         messages.append(Message(role="user", content=text))
 
         chat_sample = ChatMLSample(messages=messages)
@@ -789,7 +815,7 @@ class WebSocketManager:
     async def initialize(self): # <============================= boom
         """Initialize all pipeline components at startup"""
         
-        api_key = os.getenv("OPENROUTER_API_KEY", "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")
+        api_key = os.getenv("OPENROUTER_API_KEY", "")
 
         self.transcribe = Transcribe(on_transcription_update=self.on_transcription_update,
                                      on_transcription_stabilized=self.on_transcription_stabilized,
